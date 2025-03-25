@@ -343,8 +343,27 @@ async def process_new_match(message: types.Message, state: FSMContext):
     else:
         await message.answer("Готово, все матчи добавлены.")
         await state.finish()
-        # После внесения новых матчей прием прогнозов возобновляется
+# Удаляем прогнозы для текущей недели
+        await clear_forecasts()
+
+        # После внесения новых матчей разрешаем прогнозы
         await open_forecast(message)
+
+async def clear_forecasts():
+    """Удаляем прогнозы для текущей недели, чтобы пользователи могли ввести новые."""
+    week = datetime.now().isocalendar()[1]
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM forecasts WHERE week=$1", week)
+
+async def open_forecast(message: types.Message):
+    """Разрешаем делать прогнозы после внесения новых матчей."""
+    async with db_pool.acquire() as conn:
+        week = datetime.now().isocalendar()[1]
+        existing = await conn.fetch("SELECT * FROM forecasts WHERE telegram_id=$1 AND week=$2", message.from_user.id, week)
+        if existing:
+            await message.answer("Прогноз на эту неделю уже сделан, дождитесь следующей недели")
+        else:
+            await message.answer("Теперь вы можете сделать прогнозы на эту неделю.")
 
 async def open_forecast(message: types.Message):
     """Разрешаем делать прогнозы после внесения новых матчей."""
