@@ -82,7 +82,7 @@ async def init_db():
         # Таблица матчей: match_index (от 1 до 10), название матча и итоговый счет (результат)
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS matches (
-            match_index INTEGER PRIMARY KEY,
+            match_index SERIAL PRIMARY KEY,
             match_name TEXT,
             result TEXT
         );
