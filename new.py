@@ -100,7 +100,7 @@ async def init_db():
 # В обновлённом основном меню для администратора добавляем кнопку "Удалить все таблицы"
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз"]
+    buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз"]
     # Для админа добавляем кнопки
     if message.from_user.id in ADMIN_IDS:
         buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы"])
@@ -142,6 +142,8 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await handle_make_forecast(message, state)
     elif message.text == "Таблица лидеров":
         await handle_leaderboard(message)
+    elif message.text == "Таблица лидеров за этот месяц":
+        await handle_month_leaderboard(message)
     elif message.text == "Посмотреть мой прогноз":
         await handle_view_forecast(message)
     elif message.text == "Внести результаты" and message.from_user.id in ADMIN_IDS:
@@ -261,6 +263,22 @@ async def handle_view_forecast(message: types.Message):
             response += f"{row['match_name']} {row['forecast']}\n"
         await message.answer(response)
 
+# 5. Таблица лидеров за месяц
+@dp.message_handler(lambda message: message.text == "Таблица лидеров за этот месяц")
+async def handle_month_leaderboard(message: types.Message):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT name, points FROM monthleaders ORDER BY points DESC LIMIT 10")
+        if not rows:
+            await message.answer("Месячная таблица лидеров пуста.")
+            return
+        response = "Топ-10 за этот месяц:\n"
+        rank = 1
+        for row in rows:
+            response += f"{rank}. {row['name']} - {row['points']} очков\n"
+            rank += 1
+        await message.answer(response)
+
+
 # --- Хэндлеры для администратора ---
 
 # 1. Внести результаты – ввод результатов матчей и пересчет очков
@@ -288,6 +306,7 @@ async def send_result_entry(message: types.Message, state: FSMContext):
         await calculate_points(message)
         await message.answer("Внесите новые матчи, нажав кнопку 'Внести новые матчи'")
         await state.finish()
+
 
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=EnterResultsStates.waiting_for_result)
 async def process_result_entry(message: types.Message, state: FSMContext):
