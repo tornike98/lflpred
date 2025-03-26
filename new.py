@@ -433,7 +433,50 @@ async def delete_all_tables(message: types.Message):
         await conn.execute("DROP TABLE IF EXISTS matches CASCADE;")
         await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
         await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
-    await message.answer("Все таблицы удалены!")
+        # Пересоздаём таблицы без данных
+        
+        # Таблица пользователей
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            points INTEGER DEFAULT 0
+        );
+        ''')
+        
+        # Таблица прогнозов
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS forecasts (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT,
+            week INTEGER,
+            match_index INTEGER,
+            forecast TEXT,
+            UNIQUE(telegram_id, week, match_index)
+        );
+        ''')
+        
+        # Таблица матчей
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS matches (
+            match_index SERIAL PRIMARY KEY,
+            match_name TEXT,
+            result TEXT
+        );
+        ''')
+        
+        # Таблица месячной таблицы лидеров
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS monthleaders (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            points INTEGER DEFAULT 0
+        );
+        ''')
+        
+    await message.answer("Все таблицы удалены и созданы заново без данных!")
 
 
 # --- Запуск бота ---
