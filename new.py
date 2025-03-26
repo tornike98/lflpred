@@ -97,12 +97,13 @@ async def init_db():
         );
         ''')
 
+# В обновлённом основном меню для администратора добавляем кнопку "Удалить все таблицы"
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз"]
     # Для админа добавляем кнопки
     if message.from_user.id in ADMIN_IDS:
-        buttons.extend(["Внести результаты", "Внести новые матчи"])
+        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты"])
     keyboard.add(*buttons)
     await message.answer("Выберите действие:", reply_markup=keyboard)
 
