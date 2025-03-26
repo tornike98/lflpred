@@ -87,6 +87,15 @@ async def init_db():
             result TEXT
         );
         ''')
+        # Таблица месячной таблицы лидеров
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS monthleaders (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            points INTEGER DEFAULT 0
+        );
+        ''')
 
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -138,6 +147,8 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await admin_enter_results(message, state)
     elif message.text == "Внести новые матчи" and message.from_user.id in ADMIN_IDS:
         await admin_new_matches(message, state)
+    elif message.text == "Опубликовать результаты" and message.from_user.id in ADMIN_IDS:
+        await admin_publish_results(message)
     else:
         await message.answer("Команда не распознана")
 
@@ -315,6 +326,13 @@ async def calculate_points(message: types.Message):
                     if actual_home == forecast_home and actual_away == forecast_away:
                         points += 3
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
+                # Обновляем очки в таблице monthleaders
+                existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
+                if existing_ml:
+                    await conn.execute("UPDATE monthleaders SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
+                else:
+                    user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id=$1", forecast["telegram_id"])
+                    await conn.execute("INSERT INTO monthleaders (telegram_id, name, points) VALUES ($1, $2, $3)", forecast["telegram_id"], user["name"], points)
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
@@ -374,6 +392,35 @@ async def open_forecast(message: types.Message):
             await message.answer("Прогноз на эту неделю уже сделан, дождитесь следующей недели")
         else:
             await message.answer("Теперь вы можете сделать прогнозы на эту неделю.") 
+
+# 3. Опубликовать результаты – выгрузка топ-10 из таблицы monthleaders и сброс очков
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Опубликовать результаты")
+async def admin_publish_results(message: types.Message):
+    async with db_pool.acquire() as conn:
+        # Получаем топ-10 пользователей из таблицы monthleaders
+        top10 = await conn.fetch("SELECT telegram_id, name, points FROM monthleaders ORDER BY points DESC LIMIT 10")
+        leaderboard_text = "Месячная таблица лидеров:\n"
+        rank = 1
+        for row in top10:
+            leaderboard_text += f"{rank}. {row['name']} - {row['points']} очков\n"
+            rank += 1
+
+        # Получаем список всех пользователей
+        all_users_rows = await conn.fetch("SELECT telegram_id FROM users")
+
+    # Отправляем сообщение каждому пользователю
+    for user in all_users_rows:
+        try:
+            await bot.send_message(user["telegram_id"], leaderboard_text, parse_mode=types.ParseMode.MARKDOWN)
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения пользователю {user['telegram_id']}: {e}")
+
+    # Сбрасываем очки в таблице monthleaders
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE monthleaders SET points = 0")
+    
+    await message.answer("Данные месячной таблицы лидеров сброшены и результаты отправлены всем пользователям.")
+
 
 # --- Запуск бота ---
 if __name__ == '__main__':
