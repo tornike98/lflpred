@@ -103,7 +103,7 @@ async def send_main_menu(message: types.Message):
     buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз"]
     # Для админа добавляем кнопки
     if message.from_user.id in ADMIN_IDS:
-        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты"])
+        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы"])
     keyboard.add(*buttons)
     await message.answer("Выберите действие:", reply_markup=keyboard)
 
@@ -134,7 +134,7 @@ async def process_name(message: types.Message, state: FSMContext):
     await send_main_menu(message)
 
 # Обработка нажатия кнопок главного меню
-@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз", "Внести результаты", "Внести новые матчи"])
+@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы"])
 async def main_menu_handler(message: types.Message, state: FSMContext):
     if message.text == "Мой профиль":
         await handle_my_profile(message)
@@ -150,6 +150,8 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await admin_new_matches(message, state)
     elif message.text == "Опубликовать результаты" and message.from_user.id in ADMIN_IDS:
         await admin_publish_results(message)
+    elif message.text == "Удалить все таблицы" and message.from_user.id in ADMIN_IDS:
+        await delete_all_tables(message)
     else:
         await message.answer("Команда не распознана")
 
@@ -421,6 +423,17 @@ async def admin_publish_results(message: types.Message):
         await conn.execute("UPDATE monthleaders SET points = 0")
     
     await message.answer("Данные месячной таблицы лидеров сброшены и результаты отправлены всем пользователям.")
+
+# Новый обработчик для удаления всех таблиц
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Удалить все таблицы")
+async def delete_all_tables(message: types.Message):
+    async with db_pool.acquire() as conn:
+        # Удаляем все таблицы (с зависимостями)
+        await conn.execute("DROP TABLE IF EXISTS forecasts CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS matches CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
+    await message.answer("Все таблицы удалены!")
 
 
 # --- Запуск бота ---
