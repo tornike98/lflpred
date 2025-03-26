@@ -124,10 +124,15 @@ async def cmd_start(message: types.Message):
 async def process_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
     async with db_pool.acquire() as conn:
+        # Проверяем, существует ли уже такое имя
+        existing = await conn.fetchrow("SELECT * FROM users WHERE name=$1", name)
+        if existing:
+            await message.answer("Имя уже занято, введите другое")
+            return  # Остаёмся в том же состоянии для повторного ввода
+        # Если имя свободно, сохраняем нового пользователя
         await conn.execute("""
             INSERT INTO users (telegram_id, name)
             VALUES ($1, $2)
-            ON CONFLICT (telegram_id) DO NOTHING
         """, message.from_user.id, name)
     await state.finish()
     await message.answer(f"Добро пожаловать, {name}!")
