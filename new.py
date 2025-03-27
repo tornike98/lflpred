@@ -187,7 +187,7 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
     elif message.text == "Опубликовать результаты" and message.from_user.id in ADMIN_IDS:
         await admin_publish_results(message)
     elif message.text == "Удалить все таблицы" and message.from_user.id in ADMIN_IDS:
-        await delete_all_tables(message, state)
+        await prompt_delete_tables(message, state)
     elif message.text == "Таблица АДМИН" and message.from_user.id in ADMIN_IDS:
         await handle_admin_table(message)
     else:
