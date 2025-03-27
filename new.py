@@ -452,17 +452,10 @@ async def admin_publish_results(message: types.Message):
 class ConfirmDeleteTables(StatesGroup):
     waiting_for_confirmation = State()
 
-# Обновлённый обработчик для кнопки "Удалить все таблицы"
-@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Удалить все таблицы")
-async def ask_confirmation_delete_tables(message: types.Message):
-    await message.answer("Вы уверены, что хотите удалить все таблицы? Напишите 'да' для подтверждения или 'нет' для отмены.")
-    await ConfirmDeleteTables.waiting_for_confirmation.set()
 
 # Обработка ответа администратора на подтверждение
-@dp.message_handler(state=ConfirmDeleteTables.waiting_for_confirmation)
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message text == "Удалить все таблицы"))
 async def delete_all_tables(message: types.Message, state: FSMContext):
-    confirmation = message.text.strip().lower()
-    if confirmation == "да":
         async with db_pool.acquire() as conn:
             # Удаляем все таблицы с зависимостями
             await conn.execute("DROP TABLE IF EXISTS forecasts CASCADE;")
