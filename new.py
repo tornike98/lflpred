@@ -503,7 +503,6 @@ async def delete_all_tables(message: types.Message, state: FSMContext):
             );
             ''')
         await message.answer("Все таблицы удалены и созданы заново без данных!")
-    await state.finish()
 
 
 
