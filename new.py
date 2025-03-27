@@ -493,43 +493,42 @@ async def delete_all_tables(message: types.Message, state: FSMContext):
             # Таблица пользователей
             await conn.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE,
-                name TEXT,
-                points INTEGER DEFAULT 0
-            );
-            ''')
-            
-            # Таблица прогнозов
-            await conn.execute('''
-            CREATE TABLE IF NOT EXISTS forecasts (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT,
-                week INTEGER,
-                match_index INTEGER,
-                forecast TEXT,
-                UNIQUE(telegram_id, week, match_index)
-            );
-            ''')
-            
-            # Таблица матчей
-            await conn.execute('''
-            CREATE TABLE IF NOT EXISTS matches (
-                match_index SERIAL PRIMARY KEY,
-                match_name TEXT,
-                result TEXT
-            );
-            ''')
-            
-            # Таблица месячной таблицы лидеров
-            await conn.execute('''
-            CREATE TABLE IF NOT EXISTS monthleaders (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE,
-                name TEXT,
-                points INTEGER DEFAULT 0
-            );
-            ''')
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            phone TEXT UNIQUE,
+            points INTEGER DEFAULT 0
+        );
+        ''')
+        # Таблица прогнозов: храним прогнозы для каждого пользователя по текущей неделе
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS forecasts (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT,
+            week INTEGER,
+            match_index INTEGER,
+            forecast TEXT,
+            UNIQUE(telegram_id, week, match_index)
+        );
+        ''')
+        # Таблица матчей: match_index (от 1 до 10), название матча и итоговый счет (результат)
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS matches (
+            match_index SERIAL PRIMARY KEY,
+            match_name TEXT,
+            result TEXT
+        );
+        ''')
+        # Таблица месячной таблицы лидеров
+        await conn.execute('''
+        CREATE TABLE IF NOT EXISTS monthleaders (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE,
+            name TEXT,
+            phone TEXT,
+            points INTEGER DEFAULT 0
+        );
+        ''')
         await message.answer("Все таблицы удалены и созданы заново без данных!")
 
 # 5. Таблица АДМИН – полная таблица лидеров с именем, telegramID и номером телефона
