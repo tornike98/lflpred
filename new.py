@@ -452,7 +452,7 @@ async def admin_publish_results(message: types.Message):
 
 
 # Обработка ответа администратора на подтверждение
-@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message text == "Удалить все таблицы"))
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message text == "Удалить все таблицы")
 async def delete_all_tables(message: types.Message, state: FSMContext):
         async with db_pool.acquire() as conn:
             # Удаляем все таблицы с зависимостями
