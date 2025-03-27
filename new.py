@@ -460,7 +460,7 @@ async def ask_confirmation_delete_tables(message: types.Message):
 
 # Обработка ответа администратора на подтверждение
 @dp.message_handler(state=ConfirmDeleteTables.waiting_for_confirmation)
-async def process_delete_tables_confirmation(message: types.Message, state: FSMContext):
+async def delete_all_tables(message: types.Message, state: FSMContext):
     confirmation = message.text.strip().lower()
     if confirmation == "да":
         async with db_pool.acquire() as conn:
