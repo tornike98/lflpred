@@ -42,6 +42,9 @@ class NewMatchesStates(StatesGroup):
 
 class EnterResultsStates(StatesGroup):
     waiting_for_result = State()
+    
+class DeleteTablesStates(StatesGroup):
+    waiting_for_confirmation = State()
 
 # --- Вспомогательные функции ---
 def is_forecast_open() -> bool:
@@ -495,51 +498,62 @@ async def admin_publish_results(message: types.Message):
 
 
 # 4. Удаление всех таблиц и создание новых
+# Обработчик нажатия кнопки "Удалить все таблицы"
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Удалить все таблицы")
-async def delete_all_tables(message: types.Message, state: FSMContext):
-    async with db_pool.acquire() as conn:
-        # Удаляем все таблицы с зависимостями
-        await conn.execute("DROP TABLE IF EXISTS forecasts CASCADE;")
-        await conn.execute("DROP TABLE IF EXISTS matches CASCADE;")
-        await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
-        await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
-        # Пересоздаём таблицы без данных
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE,
-                name TEXT UNIQUE,
-                phone TEXT UNIQUE,
-                points INTEGER DEFAULT 0
-            );
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS forecasts (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT,
-                week INTEGER,
-                match_index INTEGER,
-                forecast TEXT,
-                UNIQUE(telegram_id, week, match_index)
-            );
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS matches (
-                match_index SERIAL PRIMARY KEY,
-                match_name TEXT,
-                result TEXT
-            );
-        ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS monthleaders (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT UNIQUE,
-                name TEXT,
-                phone TEXT,
-                points INTEGER DEFAULT 0
-            );
-        ''')
-    await message.answer("Все таблицы удалены и созданы заново без данных!")
+async def prompt_delete_tables(message: types.Message, state: FSMContext):
+    await message.answer("Вы уверены, что хотите удалить все таблицы? (Да/Нет)")
+    await DeleteTablesStates.waiting_for_confirmation.set()
+
+# Обработчик ответа администратора
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=DeleteTablesStates.waiting_for_confirmation)
+async def process_delete_tables_confirmation(message: types.Message, state: FSMContext):
+    if message.text.strip().lower() == "да":
+        async with db_pool.acquire() as conn:
+            # Удаляем таблицы
+            await conn.execute("DROP TABLE IF EXISTS forecasts CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS matches CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
+            # Пересоздаем таблицы без данных
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE,
+                    name TEXT UNIQUE,
+                    phone TEXT UNIQUE,
+                    points INTEGER DEFAULT 0
+                );
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS forecasts (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT,
+                    week INTEGER,
+                    match_index INTEGER,
+                    forecast TEXT,
+                    UNIQUE(telegram_id, week, match_index)
+                );
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS matches (
+                    match_index SERIAL PRIMARY KEY,
+                    match_name TEXT,
+                    result TEXT
+                );
+            ''')
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS monthleaders (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE,
+                    name TEXT,
+                    phone TEXT,
+                    points INTEGER DEFAULT 0
+                );
+            ''')
+        await message.answer("Все таблицы удалены и созданы заново без данных!")
+    else:
+        await message.answer("Удаление таблиц отменено")
+    await state.finish()
 
 
 # 5. Таблица АДМИН – полная таблица лидеров с именем, telegramID и номером телефона
