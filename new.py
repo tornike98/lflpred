@@ -201,7 +201,7 @@ async def handle_my_profile(message: types.Message):
                 if row["telegram_id"] == message.from_user.id:
                     break
                 position += 1
-            await message.answer(f"{position}. {user['name']} - {user['points']} очков". {user['phone']})
+            await message.answer(f"{position}. {user['name']} - {user['points']} очков. {user['phone']}")
         else:
             await message.answer("Пользователь не найден. Используйте /start для регистрации.")
 
