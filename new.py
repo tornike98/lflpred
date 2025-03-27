@@ -374,17 +374,23 @@ async def calculate_points(message: types.Message):
                 if len(actual_parts) == 2 and len(forecast_parts) == 2:
                     actual_home, actual_away = int(actual_parts[0]), int(actual_parts[1])
                     forecast_home, forecast_away = int(forecast_parts[0]), int(forecast_parts[1])
+                    # Определяем исход матча: 1 — победа хозяев, 0 — ничья, -1 — победа гостей
                     actual_outcome = 1 if actual_home > actual_away else (0 if actual_home == actual_away else -1)
                     forecast_outcome = 1 if forecast_home > forecast_away else (0 if forecast_home == forecast_away else -1)
+                    
                     if actual_outcome == forecast_outcome:
-                        points += 1
-                    if actual_home == forecast_home and actual_away == forecast_away:
-                        points += 3
-                # Обновляем очки у пользователя в таблице users
+                        points = 1  # Угадан исход матча
+                        # Проверяем, совпадает ли разница голов (учитываем абсолютное значение)
+                        if abs(actual_home - actual_away) == abs(forecast_home - forecast_away):
+                            points = 3  # Угадан исход и разница голов
+                            # Если еще и точный счёт, начисляем максимальное количество очков
+                            if actual_home == forecast_home and actual_away == forecast_away:
+                                points = 5
+                # Обновляем очки в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем/вставляем данные в таблицу monthleaders с передачей phone
-                existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
+                # Обновляем или вставляем запись в таблице monthleaders с данными о телефоне
                 user = await conn.fetchrow("SELECT name, phone FROM users WHERE telegram_id=$1", forecast["telegram_id"])
+                existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
                     await conn.execute(
                         "UPDATE monthleaders SET points = points + $1, phone = $2 WHERE telegram_id=$3",
@@ -396,6 +402,7 @@ async def calculate_points(message: types.Message):
                         forecast["telegram_id"], user["name"], user["phone"], points
                     )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
+
 
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
