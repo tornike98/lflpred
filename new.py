@@ -448,9 +448,7 @@ async def admin_publish_results(message: types.Message):
     
     await message.answer("Данные месячной таблицы лидеров сброшены и результаты отправлены всем пользователям.")
 
-# Новое состояние для подтверждения удаления таблиц
-class ConfirmDeleteTables(StatesGroup):
-    waiting_for_confirmation = State()
+
 
 
 # Обработка ответа администратора на подтверждение
@@ -505,11 +503,6 @@ async def delete_all_tables(message: types.Message, state: FSMContext):
             );
             ''')
         await message.answer("Все таблицы удалены и созданы заново без данных!")
-    elif confirmation == "нет":
-        await message.answer("Операция удаления таблиц отменена.")
-    else:
-        await message.answer("Неверный ввод. Пожалуйста, введите 'да' или 'нет'.")
-        return  # Остаёмся в состоянии для повторного ввода
     await state.finish()
 
 
