@@ -380,15 +380,23 @@ async def calculate_points(message: types.Message):
                         points += 1
                     if actual_home == forecast_home and actual_away == forecast_away:
                         points += 3
+                # Обновляем очки у пользователя в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем очки в таблице monthleaders
+                # Обновляем/вставляем данные в таблицу monthleaders с передачей phone
                 existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
+                user = await conn.fetchrow("SELECT name, phone FROM users WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
-                    await conn.execute("UPDATE monthleaders SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
+                    await conn.execute(
+                        "UPDATE monthleaders SET points = points + $1, phone = $2 WHERE telegram_id=$3",
+                        points, user["phone"], forecast["telegram_id"]
+                    )
                 else:
-                    user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id=$1", forecast["telegram_id"])
-                    await conn.execute("INSERT INTO monthleaders (telegram_id, name, points) VALUES ($1, $2, $3)", forecast["telegram_id"], user["name"], points)
+                    await conn.execute(
+                        "INSERT INTO monthleaders (telegram_id, name, phone, points) VALUES ($1, $2, $3, $4)",
+                        forecast["telegram_id"], user["name"], user["phone"], points
+                    )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
+
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Внести новые матчи")
