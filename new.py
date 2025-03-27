@@ -531,7 +531,7 @@ async def delete_all_tables(message: types.Message, state: FSMContext):
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Таблица АДМИН")
 async def handle_admin_table(message: types.Message):
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT telegram_id, name, phone, points FROM monthleaders ORDER BY points DESC")
+        rows = await conn.fetch("SELECT telegram_id, name, phone, points FROM users ORDER BY points DESC")
         if not rows:
             await message.answer("Месячная таблица лидеров пуста.")
             return
