@@ -102,6 +102,22 @@ async def init_db():
         );
         ''')
 
+# Функция рассылки новых матчей всем пользователям
+async def broadcast_new_matches(message: types.Message):
+    async with db_pool.acquire() as conn:
+        matches = await conn.fetch("SELECT match_name FROM matches ORDER BY match_index")
+        if matches:
+            matches_text = "\n".join(match["match_name"] for match in matches)
+            broadcast_text = f"Новые матчи на выходные добавлены, не забудь оставить прогноз:\n{matches_text}"
+        else:
+            broadcast_text = "Новые матчи на выходные добавлены, не забудь оставить прогноз."
+        users = await conn.fetch("SELECT telegram_id FROM users")
+    for user in users:
+        try:
+            await bot.send_message(user["telegram_id"], broadcast_text)
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения пользователю {user['telegram_id']}: {e}")
+
 # Основное меню
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -411,24 +427,14 @@ async def process_new_match(message: types.Message, state: FSMContext):
         await state.finish()
         # Удаляем прогнозы для текущей недели
         await clear_forecasts()
-        # После внесения новых матчей разрешаем прогнозы
-        await open_forecast(message)
+        # После внесения новых матчей рассылаем сообщение всем пользователям
+        await broadcast_new_matches(message)
 
 async def clear_forecasts():
     """Удаляем прогнозы для текущей недели, чтобы пользователи могли ввести новые."""
     week = datetime.now().isocalendar()[1]
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM forecasts WHERE week=$1", week)
-
-async def open_forecast(message: types.Message):
-    """Разрешаем делать прогнозы после внесения новых матчей."""
-    async with db_pool.acquire() as conn:
-        week = datetime.now().isocalendar()[1]
-        existing = await conn.fetch("SELECT * FROM forecasts WHERE telegram_id=$1 AND week=$2", message.from_user.id, week)
-        if existing:
-            await message.answer("Прогноз на эту неделю уже сделан, дождитесь следующей недели")
-        else:
-            await message.answer("Теперь вы можете сделать прогнозы на эту неделю.")
 
 # 3. Опубликовать результаты – выгрузка топ-10 из таблицы monthleaders и сброс очков
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Опубликовать результаты")
