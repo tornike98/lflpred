@@ -106,9 +106,9 @@ async def init_db():
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз"]
-    # Для админа добавляем кнопки
+    # Для админа добавляем дополнительные кнопки
     if message.from_user.id in ADMIN_IDS:
-        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН"])
+        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
     keyboard.add(*buttons)
     await message.answer("Выберите действие:", reply_markup=keyboard)
 
@@ -145,7 +145,7 @@ async def process_name(message: types.Message, state: FSMContext):
     await send_main_menu(message)
 
 # Обработка нажатия кнопок главного меню
-@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Посмотреть мой прогноз", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН"])
+@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
 async def main_menu_handler(message: types.Message, state: FSMContext):
     if message.text == "Мой профиль":
         await handle_my_profile(message)
@@ -167,10 +167,12 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await prompt_delete_tables(message, state)
     elif message.text == "Таблица АДМИН" and message.from_user.id in ADMIN_IDS:
         await handle_admin_table(message)
+    elif message.text == "Месяц АДМИН" and message.from_user.id in ADMIN_IDS:
+        await handle_month_admin_table(message)
     else:
         await message.answer("Команда не распознана")
 
-# 1. Мой профиль – показывает имя, позицию и очки, а также никнейм
+# 1. Мой профиль – показывает имя, позицию, очки и никнейм
 async def handle_my_profile(message: types.Message):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
@@ -290,7 +292,6 @@ async def handle_month_leaderboard(message: types.Message):
             response += f"{rank}. {row['name']} - {row['points']} очков\n"
             rank += 1
         await message.answer(response)
-
 
 # --- Хэндлеры для администратора ---
 
@@ -510,7 +511,7 @@ async def process_delete_tables_confirmation(message: types.Message, state: FSMC
         await message.answer("Удаление таблиц отменено")
     await state.finish()
 
-# 5. Таблица АДМИН – полная таблица лидеров с именем, telegramID и никнеймом
+# 5. Таблица АДМИН – полная таблица лидеров с данными из таблицы users
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Таблица АДМИН")
 async def handle_admin_table(message: types.Message):
     async with db_pool.acquire() as conn:
@@ -519,6 +520,21 @@ async def handle_admin_table(message: types.Message):
             await message.answer("Таблица лидеров пуста.")
             return
         response = "Полная таблица лидеров:\n"
+        rank = 1
+        for row in rows:
+            response += f"{rank}. {row['name']} - {row['points']} очков, TelegramID: {row['telegram_id']}, Ник: {row['nickname']}\n"
+            rank += 1
+        await message.answer(response)
+
+# 6. Месяц АДМИН – полная таблица лидеров из таблицы monthleaders
+@dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Месяц АДМИН")
+async def handle_month_admin_table(message: types.Message):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT telegram_id, name, nickname, points FROM monthleaders ORDER BY points DESC")
+        if not rows:
+            await message.answer("Месячная таблица лидеров пуста.")
+            return
+        response = "Месячная таблица лидеров (АДМИН):\n"
         rank = 1
         for row in rows:
             response += f"{rank}. {row['name']} - {row['points']} очков, TelegramID: {row['telegram_id']}, Ник: {row['nickname']}\n"
