@@ -32,7 +32,6 @@ db_pool: asyncpg.Pool = None
 # --- Состояния для FSM ---
 class RegisterStates(StatesGroup):
     waiting_for_name = State()
-    waiting_for_phone = State()
 
 class ForecastStates(StatesGroup):
     waiting_for_score = State()
@@ -63,13 +62,13 @@ async def init_db():
         user=DB_USER, password=DB_PASSWORD, database=DB_NAME, host=DB_HOST
     )
     async with db_pool.acquire() as conn:
-        # Таблица пользователей: id, telegram_id, имя и очки
+        # Таблица пользователей: id, telegram_id, имя, nickname и очки
         await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT UNIQUE,
             name TEXT,
-            phone TEXT UNIQUE,
+            nickname TEXT,
             points INTEGER DEFAULT 0
         );
         ''')
@@ -98,12 +97,12 @@ async def init_db():
             id SERIAL PRIMARY KEY,
             telegram_id BIGINT UNIQUE,
             name TEXT,
-            phone TEXT,
+            nickname TEXT,
             points INTEGER DEFAULT 0
         );
         ''')
 
-# В обновлённом основном меню для администратора добавляем кнопку "Удалить все таблицы"
+# Основное меню
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
     buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз"]
@@ -116,7 +115,6 @@ async def send_main_menu(message: types.Message):
 # --- Хэндлеры пользователя ---
 
 # Регистрация пользователя через команду /start
-# При нажатии на /start проверяем регистрацию пользователя
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     async with db_pool.acquire() as conn:
@@ -136,33 +134,12 @@ async def process_name(message: types.Message, state: FSMContext):
         existing = await conn.fetchrow("SELECT * FROM users WHERE name=$1", name)
         if existing:
             await message.answer("Имя уже занято, введите другое")
-            return  # Остаёмся в этом состоянии для повторного ввода
-        # Если имя свободно, создаём запись с phone=NULL
-        await conn.execute("""
-            INSERT INTO users (telegram_id, name, phone)
-            VALUES ($1, $2, NULL)
-        """, message.from_user.id, name)
-    await message.answer("Введите номер телефона в формате 9ХХХХХХХХХ (ровно 10 цифр, без кода страны):")
-    await RegisterStates.waiting_for_phone.set()
-
-# Обработчик ввода номера телефона
-@dp.message_handler(state=RegisterStates.waiting_for_phone)
-async def process_phone(message: types.Message, state: FSMContext):
-    phone = message.text.strip()
-    # Проверяем, что номер состоит ровно из 10 цифр
-    if not (phone.isdigit() and len(phone) == 10):
-        await message.answer("Неверный формат. Введите номер телефона ровно из 10 цифр (например, 9123456789)")
-        return
-    async with db_pool.acquire() as conn:
-        # Проверяем, существует ли уже пользователь с таким номером телефона
-        existing_phone = await conn.fetchrow("SELECT * FROM users WHERE phone=$1", phone)
-        if existing_phone:
-            await message.answer("Пользователь с таким номером телефона уже существует. Введите другой номер:")
             return
-        # Обновляем запись пользователя, добавляя номер телефона, используя telegram_id
+        # Сохраняем запись с nickname из Telegram (message.from_user.username)
         await conn.execute("""
-            UPDATE users SET phone = $1 WHERE telegram_id = $2
-        """, phone, message.from_user.id)
+            INSERT INTO users (telegram_id, name, nickname)
+            VALUES ($1, $2, $3)
+        """, message.from_user.id, name, message.from_user.username)
     await state.finish()
     await message.answer("Вы успешно зарегистрировались, желаем удачи!")
     await send_main_menu(message)
@@ -193,7 +170,7 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
     else:
         await message.answer("Команда не распознана")
 
-# 1. Мой профиль – показывает имя, позицию и очки
+# 1. Мой профиль – показывает имя, позицию и очки, а также никнейм
 async def handle_my_profile(message: types.Message):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
@@ -204,7 +181,7 @@ async def handle_my_profile(message: types.Message):
                 if row["telegram_id"] == message.from_user.id:
                     break
                 position += 1
-            await message.answer(f"{position}. {user['name']} - {user['points']} очков. {user['phone']}")
+            await message.answer(f"{position}. {user['name']} - {user['points']} очков. Ник: {user['nickname']}")
         else:
             await message.answer("Пользователь не найден. Используйте /start для регистрации.")
 
@@ -343,7 +320,6 @@ async def send_result_entry(message: types.Message, state: FSMContext):
         await message.answer("Внесите новые матчи, нажав кнопку 'Внести новые матчи'")
         await state.finish()
 
-
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=EnterResultsStates.waiting_for_result)
 async def process_result_entry(message: types.Message, state: FSMContext):
     result = message.text.strip()
@@ -391,22 +367,20 @@ async def calculate_points(message: types.Message):
                                 points = 5
                 # Обновляем очки в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем или вставляем запись в таблице monthleaders с данными о телефоне
-                user = await conn.fetchrow("SELECT name, phone FROM users WHERE telegram_id=$1", forecast["telegram_id"])
+                # Обновляем или вставляем запись в таблице monthleaders с данными о nickname
+                user = await conn.fetchrow("SELECT name, nickname FROM users WHERE telegram_id=$1", forecast["telegram_id"])
                 existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
                     await conn.execute(
-                        "UPDATE monthleaders SET points = points + $1, phone = $2 WHERE telegram_id=$3",
-                        points, user["phone"], forecast["telegram_id"]
+                        "UPDATE monthleaders SET points = points + $1, nickname = $2 WHERE telegram_id=$3",
+                        points, user["nickname"], forecast["telegram_id"]
                     )
                 else:
                     await conn.execute(
-                        "INSERT INTO monthleaders (telegram_id, name, phone, points) VALUES ($1, $2, $3, $4)",
-                        forecast["telegram_id"], user["name"], user["phone"], points
+                        "INSERT INTO monthleaders (telegram_id, name, nickname, points) VALUES ($1, $2, $3, $4)",
+                        forecast["telegram_id"], user["name"], user["nickname"], points
                     )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
-
-
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Внести новые матчи")
@@ -434,9 +408,8 @@ async def process_new_match(message: types.Message, state: FSMContext):
     else:
         await message.answer("Готово, все матчи добавлены.")
         await state.finish()
-# Удаляем прогнозы для текущей недели
+        # Удаляем прогнозы для текущей недели
         await clear_forecasts()
-
         # После внесения новых матчей разрешаем прогнозы
         await open_forecast(message)
 
@@ -456,16 +429,6 @@ async def open_forecast(message: types.Message):
         else:
             await message.answer("Теперь вы можете сделать прогнозы на эту неделю.")
 
-async def open_forecast(message: types.Message):
-    """Разрешаем делать прогнозы после внесения новых матчей."""
-    async with db_pool.acquire() as conn:
-        week = datetime.now().isocalendar()[1]
-        existing = await conn.fetch("SELECT * FROM forecasts WHERE telegram_id=$1 AND week=$2", message.from_user.id, week)
-        if existing:
-            await message.answer("Прогноз на эту неделю уже сделан, дождитесь следующей недели")
-        else:
-            await message.answer("Теперь вы можете сделать прогнозы на эту неделю.") 
-
 # 3. Опубликовать результаты – выгрузка топ-10 из таблицы monthleaders и сброс очков
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Опубликовать результаты")
 async def admin_publish_results(message: types.Message):
@@ -480,31 +443,23 @@ async def admin_publish_results(message: types.Message):
 
         # Получаем список всех пользователей
         all_users_rows = await conn.fetch("SELECT telegram_id FROM users")
-
     # Отправляем сообщение каждому пользователю
     for user in all_users_rows:
         try:
             await bot.send_message(user["telegram_id"], leaderboard_text, parse_mode=types.ParseMode.MARKDOWN)
         except Exception as e:
             logging.error(f"Ошибка при отправке сообщения пользователю {user['telegram_id']}: {e}")
-
     # Сбрасываем очки в таблице monthleaders
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE monthleaders SET points = 0")
-    
     await message.answer("Данные месячной таблицы лидеров сброшены и результаты отправлены всем пользователям.")
 
-
-
-
 # 4. Удаление всех таблиц и создание новых
-# Обработчик нажатия кнопки "Удалить все таблицы"
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Удалить все таблицы")
 async def prompt_delete_tables(message: types.Message, state: FSMContext):
     await message.answer("Вы уверены, что хотите удалить все таблицы? (Да/Нет)")
     await DeleteTablesStates.waiting_for_confirmation.set()
 
-# Обработчик ответа администратора
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=DeleteTablesStates.waiting_for_confirmation)
 async def process_delete_tables_confirmation(message: types.Message, state: FSMContext):
     if message.text.strip().lower() == "да":
@@ -520,7 +475,7 @@ async def process_delete_tables_confirmation(message: types.Message, state: FSMC
                     id SERIAL PRIMARY KEY,
                     telegram_id BIGINT UNIQUE,
                     name TEXT UNIQUE,
-                    phone TEXT UNIQUE,
+                    nickname TEXT,
                     points INTEGER DEFAULT 0
                 );
             ''')
@@ -546,7 +501,7 @@ async def process_delete_tables_confirmation(message: types.Message, state: FSMC
                     id SERIAL PRIMARY KEY,
                     telegram_id BIGINT UNIQUE,
                     name TEXT,
-                    phone TEXT,
+                    nickname TEXT,
                     points INTEGER DEFAULT 0
                 );
             ''')
@@ -555,23 +510,20 @@ async def process_delete_tables_confirmation(message: types.Message, state: FSMC
         await message.answer("Удаление таблиц отменено")
     await state.finish()
 
-
-# 5. Таблица АДМИН – полная таблица лидеров с именем, telegramID и номером телефона
+# 5. Таблица АДМИН – полная таблица лидеров с именем, telegramID и никнеймом
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Таблица АДМИН")
 async def handle_admin_table(message: types.Message):
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT telegram_id, name, phone, points FROM users ORDER BY points DESC")
+        rows = await conn.fetch("SELECT telegram_id, name, nickname, points FROM users ORDER BY points DESC")
         if not rows:
-            await message.answer("Месячная таблица лидеров пуста.")
+            await message.answer("Таблица лидеров пуста.")
             return
         response = "Полная таблица лидеров:\n"
         rank = 1
         for row in rows:
-            response += f"{rank}. {row['name']} - {row['points']} очков, TelegramID: {row['telegram_id']}, Телефон: {row['phone']}\n"
+            response += f"{rank}. {row['name']} - {row['points']} очков, TelegramID: {row['telegram_id']}, Ник: {row['nickname']}\n"
             rank += 1
         await message.answer(response)
-
-
 
 # --- Запуск бота ---
 if __name__ == '__main__':
