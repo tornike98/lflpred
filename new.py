@@ -161,7 +161,7 @@ async def process_name(message: types.Message, state: FSMContext):
     await send_main_menu(message)
 
 # Обработка нажатия кнопок главного меню
-@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
+@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз", "Посмотреть мои очки", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
 async def main_menu_handler(message: types.Message, state: FSMContext):
     if message.text == "Мой профиль":
         await handle_my_profile(message)
@@ -173,6 +173,8 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await handle_month_leaderboard(message)
     elif message.text == "Посмотреть мой прогноз":
         await handle_view_forecast(message)
+    elif message.text == "Посмотреть мои очки":
+        await handle_view_points(message)
     elif message.text == "Внести результаты" and message.from_user.id in ADMIN_IDS:
         await admin_enter_results(message, state)
     elif message.text == "Внести новые матчи" and message.from_user.id in ADMIN_IDS:
