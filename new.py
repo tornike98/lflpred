@@ -124,7 +124,7 @@ async def send_main_menu(message: types.Message):
     buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз"]
     # Для админа добавляем дополнительные кнопки
     if message.from_user.id in ADMIN_IDS:
-        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
+        buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН", "Посмотреть мои очки"])
     keyboard.add(*buttons)
     await message.answer("Выберите действие:", reply_markup=keyboard)
 
@@ -308,6 +308,62 @@ async def handle_month_leaderboard(message: types.Message):
             response += f"{rank}. {row['name']} - {row['points']} очков\n"
             rank += 1
         await message.answer(response)
+
+def compute_points(actual: str, forecast: str) -> int:
+    """Вычисляет очки за прогноз по результату матча."""
+    try:
+        actual_parts = actual.split('-')
+        forecast_parts = forecast.split('-')
+        if len(actual_parts) != 2 or len(forecast_parts) != 2:
+            return 0
+        actual_home, actual_away = int(actual_parts[0]), int(actual_parts[1])
+        forecast_home, forecast_away = int(forecast_parts[0]), int(forecast_parts[1])
+        # Определяем исход матча: 1 — победа хозяев, 0 — ничья, -1 — победа гостей
+        actual_outcome = 1 if actual_home > actual_away else (0 if actual_home == actual_away else -1)
+        forecast_outcome = 1 if forecast_home > forecast_away else (0 if forecast_home == forecast_away else -1)
+        if actual_outcome != forecast_outcome:
+            return 0
+        # Угадан исход матча
+        points = 1
+        # Если угадана разница мячей, то 3 очка
+        if abs(actual_home - actual_away) == abs(forecast_home - forecast_away):
+            points = 3
+            # Если угадан точный счёт, то 5 очков
+            if actual_home == forecast_home and actual_away == forecast_away:
+                points = 5
+        return points
+    except Exception as e:
+        return 0
+
+# 6. Посмотреть мои очки – показывает для каждого матча результат, прогноз и начисленные очки
+@dp.message_handler(lambda message: message.text == "Посмотреть мои очки")
+async def handle_view_points(message: types.Message):
+    async with db_pool.acquire() as conn:
+        # Выбираем все прогнозы пользователя, для которых уже введён результат (admin внес результат)
+        rows = await conn.fetch('''
+            SELECT m.match_name, m.result, f.forecast 
+            FROM forecasts f
+            JOIN matches m ON f.match_index = m.match_index
+            WHERE f.telegram_id=$1 AND m.result IS NOT NULL
+            ORDER BY f.match_index
+        ''', message.from_user.id)
+    if not rows:
+        await message.answer("Пока нет данных для отображения. Возможно, результаты ещё не внесены.")
+        return
+
+    response_lines = []
+    for idx, row in enumerate(rows, start=1):
+        points = compute_points(row['result'], row['forecast'])
+        # Формируем строку по примеру:
+        # 1. Арсенал - Челси 2-1 (Ваш прогноз 2-1 - 5 очков)
+        line = f"{idx}. {row['match_name']} {row['result']} (Ваш прогноз {row['forecast']} - {points} очков)"
+        response_lines.append(line)
+    response = "\n".join(response_lines)
+    await message.answer(response)
+
+
+
+
 
 # --- Хэндлеры для администратора ---
 
