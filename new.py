@@ -240,6 +240,13 @@ async def send_next_match(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=ForecastStates.waiting_for_score)
 async def process_forecast_score(message: types.Message, state: FSMContext):
+    # Дополнительная проверка времени перед обработкой ввода
+    if not is_forecast_open():
+        await message.answer("Время для внесения прогнозов истекло. Прогноз не сохранён.")
+        await state.finish()
+        await send_main_menu(message)
+        return
+
     score = message.text.strip()
     if score.count('-') != 1:
         await message.answer("Неверный формат. Введите счет в формате '2-1'")
@@ -261,7 +268,13 @@ async def process_forecast_score(message: types.Message, state: FSMContext):
     async with db_pool.acquire() as conn:
         next_match = await conn.fetchrow("SELECT * FROM matches WHERE match_index=$1", current_match_index)
     if next_match:
-        await send_next_match(message, state)
+        # Проверка времени перед переходом к следующему матчу
+        if not is_forecast_open():
+            await message.answer("Время для внесения прогнозов истекло. Прогноз сохранён.")
+            await state.finish()
+            await send_main_menu(message)
+        else:
+            await send_next_match(message, state)
     else:
         await message.answer("Прогноз принят, желаем удачи!")
         await state.finish()
