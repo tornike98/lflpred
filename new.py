@@ -341,27 +341,30 @@ def compute_points(actual: str, forecast: str) -> int:
 @dp.message_handler(lambda message: message.text == "Посмотреть мои очки")
 async def handle_view_points(message: types.Message):
     async with db_pool.acquire() as conn:
-        # Выбираем все прогнозы пользователя, для которых уже введён результат (admin внес результат)
+        # Выбираем последние 10 прогнозов пользователя, для которых уже введён результат
         rows = await conn.fetch('''
             SELECT m.match_name, m.result, f.forecast 
             FROM forecasts f
             JOIN matches m ON f.match_index = m.match_index
             WHERE f.telegram_id=$1 AND m.result IS NOT NULL
-            ORDER BY f.match_index
+            ORDER BY f.match_index DESC
+            LIMIT 10
         ''', message.from_user.id)
     if not rows:
         await message.answer("Пока нет данных для отображения. Возможно, результаты ещё не внесены.")
         return
 
+    # Если нужно вывести в хронологическом порядке (от старого к новому), переворачиваем список
+    rows = list(reversed(rows))
+    
     response_lines = []
     for idx, row in enumerate(rows, start=1):
         points = compute_points(row['result'], row['forecast'])
-        # Формируем строку по примеру:
-        # 1. Арсенал - Челси 2-1 (Ваш прогноз 2-1 - 5 очков)
         line = f"{idx}. {row['match_name']} {row['result']} (Ваш прогноз {row['forecast']} - {points} очков)"
         response_lines.append(line)
     response = "\n".join(response_lines)
     await message.answer(response)
+
 
 
 
