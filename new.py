@@ -372,7 +372,6 @@ def compute_points(actual: str, forecast: str) -> int:
 @dp.message_handler(lambda message: message.text == "Посмотреть мои очки")
 async def handle_view_points(message: types.Message):
     async with db_pool.acquire() as conn:
-        # Выбираем последние 10 прогнозов пользователя, для которых уже введён результат
         rows = await conn.fetch('''
             SELECT m.match_name, m.result, f.forecast 
             FROM forecasts f
@@ -381,14 +380,15 @@ async def handle_view_points(message: types.Message):
             ORDER BY f.match_index DESC
             LIMIT 10
         ''', message.from_user.id)
+
     if not rows:
         await message.answer("Пока нет данных для отображения. Возможно, результаты ещё не внесены.")
         return
 
-    # Переворачиваем список, чтобы вывести в хронологическом порядке (от старого к новому)
     rows = list(reversed(rows))
-    
-   for idx, row in enumerate(rows, start=1):
+
+    response_lines = []
+    for idx, row in enumerate(rows, start=1):
         points = compute_points(row['result'], row['forecast'])
         line = (
             f"{idx}. <b>{row['match_name']} {row['result']}</b>\n"
@@ -398,6 +398,8 @@ async def handle_view_points(message: types.Message):
 
     response = "\n\n".join(response_lines)
     await message.answer(response, parse_mode='HTML')
+
+
 
 
 
