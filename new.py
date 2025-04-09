@@ -388,19 +388,16 @@ async def handle_view_points(message: types.Message):
     # Переворачиваем список, чтобы вывести в хронологическом порядке (от старого к новому)
     rows = list(reversed(rows))
     
-    response_lines = []
-    for idx, row in enumerate(rows, start=1):
+   for idx, row in enumerate(rows, start=1):
         points = compute_points(row['result'], row['forecast'])
-        # Форматирование:
-        # Первая строка: номер, название матча и результат жирным шрифтом
-        # Вторая строка: прогноз пользователя и начисленные очки
         line = (
-            f"{idx}. **{row['match_name']} {row['result']}**\n"
+            f"{idx}. <b>{row['match_name']} {row['result']}</b>\n"
             f"Ваш прогноз {row['forecast']} ({points} очков)"
         )
         response_lines.append(line)
+
     response = "\n\n".join(response_lines)
-    await message.answer(response, parse_mode=types.ParseMode.MARKDOWN)
+    await message.answer(response, parse_mode='HTML')
 
 
 
