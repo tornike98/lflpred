@@ -325,15 +325,35 @@ async def process_forecast_score(message: types.Message, state: FSMContext):
         await send_main_menu(message)
 
 # 3. Таблица лидеров – вывод топ-10 пользователей
+@dp.message_handler(lambda message: message.text == "Таблица лидеров")
 async def handle_leaderboard(message: types.Message):
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT name, points FROM users ORDER BY points DESC LIMIT 10")
+        # Получаем топ-10 пользователей
+        top_rows = await conn.fetch("SELECT telegram_id, name, points FROM users ORDER BY points DESC LIMIT 10")
+        if not top_rows:
+            await message.answer("Таблица лидеров пуста.")
+            return
+
         response = "Таблица лидеров:\n"
         rank = 1
-        for row in rows:
+        for row in top_rows:
             response += f"{rank}. {row['name']} - {row['points']} очков\n"
             rank += 1
-        await message.answer(response)
+
+        # Определяем позицию текущего пользователя с использованием оконной функции
+        user_row = await conn.fetchrow("""
+            SELECT telegram_id, name, points, rank FROM (
+                SELECT telegram_id, name, points, RANK() OVER (ORDER BY points DESC) AS rank
+                FROM users
+            ) sub
+            WHERE telegram_id = $1
+        """, message.from_user.id)
+
+        if user_row:
+            response += f"\nВаш результат: {user_row['rank']} место - <b>{user_row['name']}</b> - {user_row['points']} очков"
+        
+        await message.answer(response, parse_mode='HTML')
+
 
 # 4. Посмотреть мой прогноз – показывает введенные прогнозы
 async def handle_view_forecast(message: types.Message):
