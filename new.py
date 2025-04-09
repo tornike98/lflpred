@@ -121,7 +121,7 @@ async def broadcast_new_matches(message: types.Message):
 # Основное меню
 async def send_main_menu(message: types.Message):
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз", "Посмотреть мои очки"]
+    buttons = ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица месяц", "Посмотреть мой прогноз", "Посмотреть мои очки"]
     # Для админа добавляем дополнительные кнопки
     if message.from_user.id in ADMIN_IDS:
         buttons.extend(["Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
@@ -173,7 +173,7 @@ async def process_name(message: types.Message, state: FSMContext):
     await send_main_menu(message)
 
 # Обработка нажатия кнопок главного меню
-@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица лидеров за этот месяц", "Посмотреть мой прогноз", "Посмотреть мои очки", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
+@dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица месяц", "Посмотреть мой прогноз", "Посмотреть мои очки", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
 async def main_menu_handler(message: types.Message, state: FSMContext):
     if message.text == "Мой профиль":
         await handle_my_profile(message)
@@ -181,7 +181,7 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
         await handle_make_forecast(message, state)
     elif message.text == "Таблица лидеров":
         await handle_leaderboard(message)
-    elif message.text == "Таблица лидеров за этот месяц":
+    elif message.text == "Таблица месяц":
         await handle_month_leaderboard(message)
     elif message.text == "Посмотреть мой прогноз":
         await handle_view_forecast(message)
@@ -354,7 +354,7 @@ async def handle_view_forecast(message: types.Message):
         await message.answer(response)
 
 # 5. Таблица лидеров за месяц
-@dp.message_handler(lambda message: message.text == "Таблица лидеров за этот месяц")
+@dp.message_handler(lambda message: message.text == "Таблица месяц")
 async def handle_month_leaderboard(message: types.Message):
     async with db_pool.acquire() as conn:
         # Получаем топ-10 пользователей из таблицы monthleaders
