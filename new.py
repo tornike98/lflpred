@@ -652,9 +652,15 @@ async def handle_month_admin_table(message: types.Message):
             rank += 1
         await message.answer(response)
 
-# --- Запуск бота ---
+async def on_startup(dispatcher):
+    # Инициализация базы данных, создание или миграция таблиц
+    await init_db()
+    # Можно добавить рассылку сообщений о новых изменениях или иные операции
+    logging.info("Бот запущен и обновления применены")
+    
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+
