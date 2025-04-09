@@ -490,6 +490,7 @@ async def admin_enter_results(message: types.Message, state: FSMContext):
     await EnterResultsStates.waiting_for_result.set()
     await send_result_entry(message, state)
 
+
 async def send_result_entry(message: types.Message, state: FSMContext):
     data = await state.get_data()
     result_index = data.get("result_index")
@@ -504,14 +505,12 @@ async def send_result_entry(message: types.Message, state: FSMContext):
         await message.answer("Внесите новые матчи, нажав кнопку 'Внести новые матчи'")
         await state.finish()
 
+
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=EnterResultsStates.waiting_for_result)
 async def process_result_entry(message: types.Message, state: FSMContext):
-    result = message.text.strip().lower()
-    # Если введён «тп», принимаем его как корректное значение
-    if result == "тп":
-        pass  # Будет обработано как технический проигрыш (0 очков для всех)
-    else:
-        # Проверка формата для обычного результата, например "3-4"
+    result = message.text.strip().lower()  # Приводим к нижнему регистру для унификации
+    # Если результат равен "тп", принимаем его без проверки формата
+    if result != "тп":
         if result.count('-') != 1:
             await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
             return
@@ -519,13 +518,15 @@ async def process_result_entry(message: types.Message, state: FSMContext):
         if not (parts[0].isdigit() and parts[1].isdigit()):
             await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
             return
+
     data = await state.get_data()
-    result_index = data.get("result_index")
+    result_index = int(data.get("result_index", 1))
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE matches SET result=$1 WHERE match_index=$2", result, result_index)
     result_index += 1
     await state.update_data(result_index=result_index)
     await send_result_entry(message, state)
+
 
 
 async def calculate_points(message: types.Message):
@@ -535,13 +536,30 @@ async def calculate_points(message: types.Message):
         for forecast in forecasts:
             match = await conn.fetchrow("SELECT result FROM matches WHERE match_index=$1", forecast["match_index"])
             if match and match["result"]:
-                actual = match["result"]
+                actual = match["result"].lower()  # для унификации, преобразуем результат к нижнему регистру
                 user_forecast = forecast["forecast"]
-                # Здесь, если actual == "тп", compute_points вернет 0
-                points = compute_points(actual, user_forecast)
-                # Обновляем очки в таблице users
+                # Если фактический результат — "тп", начисляем 0 очков для всех
+                if actual == "тп":
+                    points = 0
+                else:
+                    points = 0
+                    actual_parts = actual.split('-')
+                    forecast_parts = user_forecast.split('-')
+                    if len(actual_parts) == 2 and len(forecast_parts) == 2:
+                        actual_home, actual_away = int(actual_parts[0]), int(actual_parts[1])
+                        forecast_home, forecast_away = int(forecast_parts[0]), int(forecast_parts[1])
+                        # Определяем исход матча: 1 — победа хозяев, 0 — ничья, -1 — победа гостей
+                        actual_outcome = 1 if actual_home > actual_away else (0 if actual_home == actual_away else -1)
+                        forecast_outcome = 1 if forecast_home > forecast_away else (0 if forecast_home == forecast_away else -1)
+                        if actual_outcome == forecast_outcome:
+                            points = 1  # Угадан исход матча
+                            if abs(actual_home - actual_away) == abs(forecast_home - forecast_away):
+                                points = 3  # Угадан исход и разница голов
+                                if actual_home == forecast_home and actual_away == forecast_away:
+                                    points = 5
+                # Обновляем очки у пользователя в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем или вставляем запись в таблицу monthleaders
+                # Обновляем или вставляем данные в таблицу monthleaders
                 user = await conn.fetchrow("SELECT name, nickname FROM users WHERE telegram_id=$1", forecast["telegram_id"])
                 existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
@@ -555,6 +573,7 @@ async def calculate_points(message: types.Message):
                         forecast["telegram_id"], user["name"], user["nickname"], points
                     )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
+
 
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
