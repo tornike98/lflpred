@@ -325,16 +325,32 @@ async def handle_view_forecast(message: types.Message):
 @dp.message_handler(lambda message: message.text == "Таблица лидеров за этот месяц")
 async def handle_month_leaderboard(message: types.Message):
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT name, points FROM monthleaders ORDER BY points DESC LIMIT 10")
-        if not rows:
+        # Получаем топ-10 пользователей из таблицы monthleaders
+        top_rows = await conn.fetch("SELECT name, points FROM monthleaders ORDER BY points DESC LIMIT 10")
+        if not top_rows:
             await message.answer("Месячная таблица лидеров пуста.")
             return
         response = "Топ-10 за этот месяц:\n"
         rank = 1
-        for row in rows:
+        for row in top_rows:
             response += f"{rank}. {row['name']} - {row['points']} очков\n"
             rank += 1
-        await message.answer(response)
+
+        # Запрос для определения позиции текущего пользователя с использованием оконной функции
+        user_row = await conn.fetchrow("""
+            SELECT telegram_id, name, points, rank FROM (
+                SELECT telegram_id, name, points, RANK() OVER (ORDER BY points DESC) as rank
+                FROM monthleaders
+            ) sub
+            WHERE telegram_id = $1
+        """, message.from_user.id)
+
+        if user_row:
+            # Жирным выделяем номер места
+            response += f"\nВаш результат: <b>{user_row['rank']}</b>. {user_row['name']} - {user_row['points']} очков"
+
+        await message.answer(response, parse_mode='HTML')
+
 
 def compute_points(actual: str, forecast: str) -> int:
     """Вычисляет очки за прогноз по результату матча.
