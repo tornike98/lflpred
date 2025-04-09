@@ -108,9 +108,9 @@ async def broadcast_new_matches(message: types.Message):
         matches = await conn.fetch("SELECT match_name FROM matches ORDER BY match_index")
         if matches:
             matches_text = "\n".join(match["match_name"] for match in matches)
-            broadcast_text = f"Новые матчи на выходные добавлены, не забудь оставить прогноз:\n{matches_text}"
+            broadcast_text = f"Новые матчи на выходные добавлены 😃, не забудь оставить прогноз:\n{matches_text}"
         else:
-            broadcast_text = "Новые матчи на выходные добавлены, не забудь оставить прогноз."
+            broadcast_text = "Новые матчи на выходные добавлены 😃, не забудь оставить прогноз."
         users = await conn.fetch("SELECT telegram_id FROM users")
     for user in users:
         try:
@@ -136,7 +136,7 @@ async def cmd_start(message: types.Message):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
         if not user:
-            await message.answer("Привет! Введите, пожалуйста, ваше имя:")
+            await message.answer("Привет!👋 Введите, пожалуйста, ваше имя:")
             await RegisterStates.waiting_for_name.set()
         else:
             await send_main_menu(message)
@@ -167,6 +167,7 @@ async def process_name(message: types.Message, state: FSMContext):
         "   - 3 очка за угаданный исход и разницу мячей;\n"
         "   - 1 очко за угаданный исход матча.\n"
         "4. Таблица лидеров обновляется после внесения результатов администратором.\n"
+        "5. Если матч не состоялся или одной из команд присвоен статус "Техническое поражение", пользователи не получают очки.\n"
         "Удачи!"
     )
     await message.answer(rules_text)
