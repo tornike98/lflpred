@@ -236,7 +236,7 @@ async def handle_my_profile(message: types.Message):
 
         # Формируем итоговое сообщение
         response = (
-            f"{user['name']}. Ник: {user['nickname']}\n"
+            f"<b>{user['name']}</b>. Ник: {user['nickname']}\n"
             "Полная таблица лидеров:\n"
             f"<b>{overall_rank} место - {user['points']} очков.</b>\n"
             "Таблица лидеров за месяц:\n"
