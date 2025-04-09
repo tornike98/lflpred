@@ -350,7 +350,7 @@ async def handle_leaderboard(message: types.Message):
         """, message.from_user.id)
 
         if user_row:
-            response += f"\nВаш результат: {user_row['rank']} место - <b>{user_row['name']}</b> - {user_row['points']} очков"
+            response += f"\n<b>Ваш результат:</b> {user_row['rank']}. - {user_row['name']} - {user_row['points']} очков"
         
         await message.answer(response, parse_mode='HTML')
 
@@ -399,7 +399,7 @@ async def handle_month_leaderboard(message: types.Message):
 
         if user_row:
             # Жирным выделяем номер места
-            response += f"\nВаш результат: <b>{user_row['rank']}. {user_row['name']}</b> - {user_row['points']} очков"
+            response += f"\n<b>Ваш результат:</b> {user_row['rank']}. {user_row['name']} - {user_row['points']} очков"
 
         await message.answer(response, parse_mode='HTML')
 
