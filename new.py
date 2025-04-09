@@ -205,17 +205,49 @@ async def main_menu_handler(message: types.Message, state: FSMContext):
 # 1. Мой профиль – показывает имя, позицию, очки и никнейм
 async def handle_my_profile(message: types.Message):
     async with db_pool.acquire() as conn:
+        # Получаем данные пользователя из таблицы users
         user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
-        if user:
-            rows = await conn.fetch("SELECT telegram_id FROM users ORDER BY points DESC")
-            position = 1
-            for row in rows:
-                if row["telegram_id"] == message.from_user.id:
-                    break
-                position += 1
-            await message.answer(f"{position}. {user['name']} - {user['points']} очков. Ник: {user['nickname']}")
-        else:
+        if not user:
             await message.answer("Пользователь не найден. Используйте /start для регистрации.")
+            return
+
+        # Определяем позицию пользователя в полной таблице лидеров (таблица users)
+        rows = await conn.fetch("SELECT telegram_id FROM users ORDER BY points DESC")
+        overall_rank = 1
+        for row in rows:
+            if row["telegram_id"] == message.from_user.id:
+                break
+            overall_rank += 1
+
+        # Определяем позицию пользователя в месячной таблице лидеров (таблица monthleaders)
+        monthly_row = await conn.fetchrow("""
+            SELECT telegram_id, name, points, rank FROM (
+                SELECT telegram_id, name, points, RANK() OVER (ORDER BY points DESC) as rank
+                FROM monthleaders
+            ) sub
+            WHERE telegram_id = $1
+        """, message.from_user.id)
+
+        if monthly_row:
+            monthly_rank = monthly_row["rank"]
+            monthly_points = monthly_row["points"]
+        else:
+            monthly_rank = None
+
+        # Формируем итоговое сообщение
+        response = (
+            f"{user['name']}. Ник: {user['nickname']}\n"
+            "Полная таблица лидеров:\n"
+            f"<b>{overall_rank} место - {user['points']} очков.</b>\n"
+            "Таблица лидеров за месяц:\n"
+        )
+        if monthly_rank is not None:
+            response += f"<b>{monthly_rank} место - {monthly_points} очков.</b>"
+        else:
+            response += "<b>Нет записи в месячной таблице лидеров.</b>"
+
+        await message.answer(response, parse_mode='HTML')
+
 
 # 2. Сделать прогноз – пользователь вводит прогнозы по матчам
 async def handle_make_forecast(message: types.Message, state: FSMContext):
