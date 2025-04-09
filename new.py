@@ -337,8 +337,13 @@ async def handle_month_leaderboard(message: types.Message):
         await message.answer(response)
 
 def compute_points(actual: str, forecast: str) -> int:
-    """Вычисляет очки за прогноз по результату матча."""
+    """Вычисляет очки за прогноз по результату матча.
+    Если реальный результат - 'тп' (технический проигрыш), возвращает 0 очков."""
     try:
+        # Если результат матча технический проигрыш, начисляем 0 очков для всех
+        if actual.lower() == "тп":
+            return 0
+
         actual_parts = actual.split('-')
         forecast_parts = forecast.split('-')
         if len(actual_parts) != 2 or len(forecast_parts) != 2:
@@ -361,6 +366,7 @@ def compute_points(actual: str, forecast: str) -> int:
         return points
     except Exception as e:
         return 0
+
 
 # 6. Посмотреть мои очки – показывает для каждого матча результат, прогноз и начисленные очки
 @dp.message_handler(lambda message: message.text == "Посмотреть мои очки")
@@ -425,14 +431,19 @@ async def send_result_entry(message: types.Message, state: FSMContext):
 
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS, state=EnterResultsStates.waiting_for_result)
 async def process_result_entry(message: types.Message, state: FSMContext):
-    result = message.text.strip()
-    if result.count('-') != 1:
-        await message.answer("Неверный формат. Введите результат в формате '3-4'")
-        return
-    parts = result.split('-')
-    if not (parts[0].isdigit() and parts[1].isdigit()):
-        await message.answer("Неверный формат. Введите результат в формате '3-4'")
-        return
+    result = message.text.strip().lower()
+    # Если введён «тп», принимаем его как корректное значение
+    if result == "тп":
+        pass  # Будет обработано как технический проигрыш (0 очков для всех)
+    else:
+        # Проверка формата для обычного результата, например "3-4"
+        if result.count('-') != 1:
+            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
+            return
+        parts = result.split('-')
+        if not (parts[0].isdigit() and parts[1].isdigit()):
+            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
+            return
     data = await state.get_data()
     result_index = data.get("result_index")
     async with db_pool.acquire() as conn:
@@ -440,6 +451,7 @@ async def process_result_entry(message: types.Message, state: FSMContext):
     result_index += 1
     await state.update_data(result_index=result_index)
     await send_result_entry(message, state)
+
 
 async def calculate_points(message: types.Message):
     week = datetime.now().isocalendar()[1]
@@ -450,27 +462,11 @@ async def calculate_points(message: types.Message):
             if match and match["result"]:
                 actual = match["result"]
                 user_forecast = forecast["forecast"]
-                points = 0
-                actual_parts = actual.split('-')
-                forecast_parts = user_forecast.split('-')
-                if len(actual_parts) == 2 and len(forecast_parts) == 2:
-                    actual_home, actual_away = int(actual_parts[0]), int(actual_parts[1])
-                    forecast_home, forecast_away = int(forecast_parts[0]), int(forecast_parts[1])
-                    # Определяем исход матча: 1 — победа хозяев, 0 — ничья, -1 — победа гостей
-                    actual_outcome = 1 if actual_home > actual_away else (0 if actual_home == actual_away else -1)
-                    forecast_outcome = 1 if forecast_home > forecast_away else (0 if forecast_home == forecast_away else -1)
-                    
-                    if actual_outcome == forecast_outcome:
-                        points = 1  # Угадан исход матча
-                        # Проверяем, совпадает ли разница голов (учитываем абсолютное значение)
-                        if abs(actual_home - actual_away) == abs(forecast_home - forecast_away):
-                            points = 3  # Угадан исход и разница голов
-                            # Если еще и точный счёт, начисляем максимальное количество очков
-                            if actual_home == forecast_home and actual_away == forecast_away:
-                                points = 5
+                # Здесь, если actual == "тп", compute_points вернет 0
+                points = compute_points(actual, user_forecast)
                 # Обновляем очки в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем или вставляем запись в таблице monthleaders с данными о nickname
+                # Обновляем или вставляем запись в таблицу monthleaders
                 user = await conn.fetchrow("SELECT name, nickname FROM users WHERE telegram_id=$1", forecast["telegram_id"])
                 existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
@@ -484,6 +480,7 @@ async def calculate_points(message: types.Message):
                         forecast["telegram_id"], user["name"], user["nickname"], points
                     )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
+
 
 # 2. Внести новые матчи – ввод 10 матчей по одному
 @dp.message_handler(lambda message: message.from_user.id in ADMIN_IDS and message.text == "Внести новые матчи")
