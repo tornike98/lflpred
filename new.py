@@ -725,14 +725,13 @@ async def handle_month_admin_table(message: types.Message):
         await message.answer(response)
 
 async def on_startup(dispatcher):
-    # Инициализация базы данных, создание или миграция таблиц
+    # Удаляем webhook, если он был установлен, чтобы избежать конфликта при polling
+    await bot.delete_webhook(drop_pending_updates=True)
     await init_db()
-    # Можно добавить рассылку сообщений о новых изменениях или иные операции
     logging.info("Бот запущен и обновления применены")
-    
+
 if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     loop.run_until_complete(init_db())
     from aiogram import executor
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
-
