@@ -536,9 +536,8 @@ async def calculate_points(message: types.Message):
         for forecast in forecasts:
             match = await conn.fetchrow("SELECT result FROM matches WHERE match_index=$1", forecast["match_index"])
             if match and match["result"]:
-                actual = match["result"].lower()  # для унификации, преобразуем результат к нижнему регистру
+                actual = match["result"].lower()  # Приводим результат к нижнему регистру
                 user_forecast = forecast["forecast"]
-                # Если фактический результат — "тп", начисляем 0 очков для всех
                 if actual == "тп":
                     points = 0
                 else:
@@ -548,19 +547,22 @@ async def calculate_points(message: types.Message):
                     if len(actual_parts) == 2 and len(forecast_parts) == 2:
                         actual_home, actual_away = int(actual_parts[0]), int(actual_parts[1])
                         forecast_home, forecast_away = int(forecast_parts[0]), int(forecast_parts[1])
-                        # Определяем исход матча: 1 — победа хозяев, 0 — ничья, -1 — победа гостей
                         actual_outcome = 1 if actual_home > actual_away else (0 if actual_home == actual_away else -1)
                         forecast_outcome = 1 if forecast_home > forecast_away else (0 if forecast_home == forecast_away else -1)
                         if actual_outcome == forecast_outcome:
-                            points = 1  # Угадан исход матча
+                            points = 1
                             if abs(actual_home - actual_away) == abs(forecast_home - forecast_away):
-                                points = 3  # Угадан исход и разница голов
+                                points = 3
                                 if actual_home == forecast_home and actual_away == forecast_away:
                                     points = 5
                 # Обновляем очки у пользователя в таблице users
                 await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", points, forecast["telegram_id"])
-                # Обновляем или вставляем данные в таблицу monthleaders
+                # Получаем данные пользователя
                 user = await conn.fetchrow("SELECT name, nickname FROM users WHERE telegram_id=$1", forecast["telegram_id"])
+                if not user:
+                    logging.warning("Пользователь с telegram_id %s не найден", forecast["telegram_id"])
+                    continue  # Если пользователь не найден, пропускаем обновление для этой записи
+                # Обновляем или вставляем данные в таблицу monthleaders
                 existing_ml = await conn.fetchrow("SELECT * FROM monthleaders WHERE telegram_id=$1", forecast["telegram_id"])
                 if existing_ml:
                     await conn.execute(
@@ -573,6 +575,7 @@ async def calculate_points(message: types.Message):
                         forecast["telegram_id"], user["name"], user["nickname"], points
                     )
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
+
 
 
 
