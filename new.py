@@ -26,17 +26,26 @@ DB_HOST = os.getenv("DB_HOST")
 
 class RegistrationCheckMiddleware(BaseMiddleware):
     async def on_process_message(self, message: types.Message, data: dict):
-        # Если сообщение начинается с /start, пропускаем проверку
+        # Если команда /start – пропускаем проверку
         if message.text and message.text.startswith("/start"):
             return
+
+        # Если пользователь находится в состоянии регистрации, то пропускаем проверку
+        state: FSMContext = data.get("state")
+        if state is not None:
+            current_state = await state.get_state()
+            if current_state and current_state.startswith("RegisterStates"):
+                return
+
         # Подключаемся к базе и ищем пользователя по telegram_id
         async with db_pool.acquire() as conn:
             user = await conn.fetchrow("SELECT telegram_id FROM users WHERE telegram_id=$1", message.from_user.id)
         if not user:
-            # Если пользователя нет, просим зарегистрироваться
+            # Если пользователь не найден, просим зарегистрироваться
             await message.answer("Вы не зарегистрированы. Пожалуйста, зарегистрируйтесь, введя /start")
             # Отменяем дальнейшую обработку этого сообщения
             raise CancelHandler()
+
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
