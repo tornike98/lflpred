@@ -10,6 +10,8 @@ from aiogram.types import ReplyKeyboardMarkup
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.dispatcher.handler import CancelHandler
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -26,6 +28,8 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+# Добавляем middleware проверки регистрации
+dp.middleware.setup(RegistrationCheckMiddleware())
 
 db_pool: asyncpg.Pool = None
 
@@ -130,6 +134,22 @@ async def send_main_menu(message: types.Message):
 
 # --- Хэндлеры пользователя ---
 
+
+class RegistrationCheckMiddleware(BaseMiddleware):
+    async def on_process_message(self, message: types.Message, data: dict):
+        # Если сообщение начинается с /start, пропускаем проверку
+        if message.text and message.text.startswith("/start"):
+            return
+        # Подключаемся к базе и ищем пользователя по telegram_id
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT telegram_id FROM users WHERE telegram_id=$1", message.from_user.id)
+        if not user:
+            # Если пользователя нет, просим зарегистрироваться
+            await message.answer("Вы не зарегистрированы. Пожалуйста, зарегистрируйтесь, введя /start")
+            # Отменяем дальнейшую обработку этого сообщения
+            raise CancelHandler()
+
+
 # Регистрация пользователя через команду /start
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
@@ -151,11 +171,13 @@ async def process_name(message: types.Message, state: FSMContext):
         if existing:
             await message.answer("Имя уже занято, введите другое")
             return
-        # Сохраняем запись с nickname из Telegram (message.from_user.username)
+        # Если username отсутствует, используем "ник скрыт"
+        nickname = message.from_user.username if message.from_user.username else "ник скрыт"
+        # Сохраняем данные пользователя
         await conn.execute("""
             INSERT INTO users (telegram_id, name, nickname)
             VALUES ($1, $2, $3)
-        """, message.from_user.id, name, message.from_user.username)
+        """, message.from_user.id, name, nickname)
     await state.finish()
     rules_text = (
         "Вы успешно зарегистрировались, желаем удачи! 🤝\n\n"
@@ -172,6 +194,7 @@ async def process_name(message: types.Message, state: FSMContext):
     )
     await message.answer(rules_text)
     await send_main_menu(message)
+
 
 # Обработка нажатия кнопок главного меню
 @dp.message_handler(lambda message: message.text in ["Мой профиль", "Сделать прогноз", "Таблица лидеров", "Таблица месяц", "Посмотреть мой прогноз", "Посмотреть мои очки", "Внести результаты", "Внести новые матчи", "Опубликовать результаты", "Удалить все таблицы", "Таблица АДМИН", "Месяц АДМИН"])
