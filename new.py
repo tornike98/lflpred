@@ -3,6 +3,7 @@ import asyncpg
 import logging
 import os
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types
@@ -74,11 +75,12 @@ class DeleteTablesStates(StatesGroup):
 
 # --- Вспомогательные функции ---
 def is_forecast_open() -> bool:
-    now = datetime.now()
-    # Прогнозы принимаются до пятницы 21:00 по времени сервера
-    if now.weekday() < 4:
+    # Получаем текущее время для Москвы
+    moscow_time = datetime.now(ZoneInfo("Europe/Moscow"))
+    # Прогнозы принимаются до пятницы 23:00 по московскому времени
+    if moscow_time.weekday() < 4:
         return True
-    elif now.weekday() == 4 and now.time() <= time(21, 0):
+    elif moscow_time.weekday() == 4 and moscow_time.time() <= time(21, 0):
         return True
     return False
 
