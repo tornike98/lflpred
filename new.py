@@ -78,7 +78,7 @@ def is_forecast_open() -> bool:
     # Прогнозы принимаются до пятницы 23:00
     if now.weekday() < 4:
         return True
-    elif now.weekday() == 4 and now.time() <= time(23, 0):
+    elif now.weekday() == 4 and now.time() <= time(21, 0):
         return True
     return False
 
