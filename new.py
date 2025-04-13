@@ -296,7 +296,7 @@ async def handle_my_profile(message: types.Message):
 # 2. Сделать прогноз – пользователь вводит прогнозы по матчам
 async def handle_make_forecast(message: types.Message, state: FSMContext):
     if not is_forecast_open():
-        await message.answer("Прием прогнозов остановлен")
+        await message.answer("Прием прогнозов остановлен. Дождитесь вторника 18:00.")
         return
     async with db_pool.acquire() as conn:
         matches = await conn.fetch("SELECT * FROM matches ORDER BY match_index")
