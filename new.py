@@ -2,7 +2,7 @@ import asyncio
 import asyncpg
 import logging
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
@@ -483,20 +483,39 @@ def compute_points(actual: str, forecast: str) -> int:
 # 6. Посмотреть мои очки – показывает для каждого матча результат, прогноз и начисленные очки
 @dp.message_handler(lambda message: message.text == "Посмотреть мои очки")
 async def handle_view_points(message: types.Message):
+    # Определяем номер прошлой ISO‑недели
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    # каждый понедельник datetime.isocalendar()[1] меняется,
+    # но если сегодня понедельник, то прошлой считается предыдущая
+    last_monday = today - timedelta(days=today.weekday())  # текущий понедельник
+    prev_week_date = last_monday - timedelta(days=1)      # воскресенье прошлой недели
+    prev_week = prev_week_date.isocalendar()[1]
+
     async with db_pool.acquire() as conn:
+        # Сначала проверяем, есть ли прогнозы пользователя за прошлую неделю
+        cnt = await conn.fetchval(
+            "SELECT COUNT(*) FROM forecasts WHERE telegram_id=$1 AND week=$2",
+            message.from_user.id, prev_week
+        )
+        if cnt == 0:
+            await message.answer("Вы не делали прогноз на прошлой неделе")
+            return
+
+        # Если прогнозы есть, собираем результаты для тех матчей, где уже есть результат
         rows = await conn.fetch('''
             SELECT m.match_name, m.result, f.forecast 
             FROM forecasts f
             JOIN matches m ON f.match_index = m.match_index
-            WHERE f.telegram_id=$1 AND m.result IS NOT NULL
+            WHERE f.telegram_id=$1 AND f.week=$2 AND m.result IS NOT NULL
             ORDER BY f.match_index DESC
             LIMIT 10
-        ''', message.from_user.id)
+        ''', message.from_user.id, prev_week)
 
     if not rows:
-        await message.answer("Пока нет данных для отображения. Возможно, результаты ещё не внесены.")
+        await message.answer("Пока нет данных для отображения — результаты еще не внесены.")
         return
 
+    # Меняем порядок на хронологический
     rows = list(reversed(rows))
 
     response_lines = []
@@ -508,10 +527,7 @@ async def handle_view_points(message: types.Message):
         )
         response_lines.append(line)
 
-    response = "\n\n".join(response_lines)
-    await message.answer(response, parse_mode='HTML')
-
-
+    await message.answer("\n\n".join(response_lines), parse_mode='HTML')
 
 
 
