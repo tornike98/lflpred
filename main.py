@@ -15,11 +15,7 @@ from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 # -------------------- ENV --------------------
 load_dotenv()
@@ -42,7 +38,6 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # -------------------- GLOBALS --------------------
 db_pool: Optional[asyncpg.Pool] = None
-
 router = Router()
 
 MENU_BUTTONS = [
@@ -101,52 +96,21 @@ def previous_isoyear_week() -> Tuple[int, int]:
     return int(iso.year), int(iso.week)
 
 
-def results_target_isoyear_week() -> Tuple[int, int]:
-    # Логика “как в жизни”: в Сб/Вс чаще вносят результаты за текущую неделю,
-    # в Пн–Пт — за прошлую.
-    wd = moscow_now().weekday()  # 0=Пн..6=Вс
-    if wd in (5, 6):  # Сб, Вс
-        return current_isoyear_week()
-    return previous_isoyear_week()
+def is_forecast_open() -> bool:
+    t = moscow_now()
+    weekday = t.weekday()  # Пн=0..Вс=6
+    current_time = t.time()
 
-
-# -------------------- MIDDLEWARE --------------------
-class RegistrationCheckMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-        event: Message,
-        data: Dict[str, Any],
-    ) -> Any:
-        # /start пропускаем
-        if event.text and event.text.startswith("/start"):
-            return await handler(event, data)
-
-        # Если пользователь в процессе регистрации — пропускаем
-        state: Optional[FSMContext] = data.get("state")
-        if state:
-            current_state = await state.get_state()
-            if current_state == RegisterStates.waiting_for_name.state:
-                return await handler(event, data)
-
-        if db_pool is None:
-            await event.answer("База данных ещё не инициализирована, попробуйте позже.")
-            return
-
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow(
-                "SELECT 1 FROM users WHERE telegram_id=$1",
-                event.from_user.id,
-            )
-
-        if not user:
-            await event.answer("Вы не зарегистрированы. Пожалуйста, зарегистрируйтесь, введя /start")
-            return  # останавливаем обработку
-
-        return await handler(event, data)
-
-
-router.message.middleware(RegistrationCheckMiddleware())
+    # вторник — с 18:00
+    if weekday == 1:
+        return current_time >= time(18, 0)
+    # пятница — до 21:00
+    elif weekday == 4:
+        return current_time < time(21, 0)
+    # среда/четверг — открыто
+    elif weekday in (2, 3):
+        return True
+    return False
 
 
 # -------------------- UI HELPERS --------------------
@@ -172,21 +136,41 @@ async def send_main_menu(message: Message) -> None:
     await message.answer("Выберите действие:", reply_markup=build_main_menu(message.from_user.id))
 
 
-def is_forecast_open() -> bool:
-    t = moscow_now()
-    weekday = t.weekday()
-    current_time = t.time()
+# -------------------- MIDDLEWARE --------------------
+class RegistrationCheckMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any],
+    ) -> Any:
+        if event.text and event.text.startswith("/start"):
+            return await handler(event, data)
 
-    if weekday == 1:  # вторник
-        return current_time >= time(18, 0)
-    elif weekday == 4:  # пятница
-        return current_time < time(21, 0)
-    elif weekday in (2, 3):  # среда/четверг
-        return True
-    return False
+        state: Optional[FSMContext] = data.get("state")
+        if state:
+            current_state = await state.get_state()
+            if current_state == RegisterStates.waiting_for_name.state:
+                return await handler(event, data)
+
+        if db_pool is None:
+            await event.answer("База данных ещё не инициализирована, попробуйте позже.")
+            return
+
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT 1 FROM users WHERE telegram_id=$1", event.from_user.id)
+
+        if not user:
+            await event.answer("Вы не зарегистрированы. Пожалуйста, зарегистрируйтесь, введя /start")
+            return
+
+        return await handler(event, data)
 
 
-# -------------------- DB INIT + MIGRATION --------------------
+router.message.middleware(RegistrationCheckMiddleware())
+
+
+# -------------------- DB (with safe migration) --------------------
 async def _maybe_rename_legacy(conn: asyncpg.Connection, table: str, required_cols: set[str]) -> None:
     reg = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
     if not reg:
@@ -214,7 +198,6 @@ async def init_db() -> None:
     )
 
     async with db_pool.acquire() as conn:
-        # users
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -227,7 +210,6 @@ async def init_db() -> None:
             """
         )
 
-        # monthleaders
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS monthleaders (
@@ -240,11 +222,10 @@ async def init_db() -> None:
             """
         )
 
-        # Если в базе остались старые таблицы matches/forecasts без week+iso_year — переименуем их в *_legacy_*
+        # если в БД остались старые matches/forecasts без iso_year/week — переименуем их
         await _maybe_rename_legacy(conn, "matches", {"iso_year", "week", "match_index", "match_name"})
         await _maybe_rename_legacy(conn, "forecasts", {"iso_year", "week", "match_index", "telegram_id", "forecast"})
 
-        # matches (с привязкой к неделе)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS matches (
@@ -259,7 +240,6 @@ async def init_db() -> None:
             """
         )
 
-        # forecasts (с привязкой к неделе)
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS forecasts (
@@ -275,7 +255,46 @@ async def init_db() -> None:
         )
 
 
-# -------------------- BUSINESS LOGIC --------------------
+# -------------------- ADMIN HELPERS (NEW) --------------------
+async def get_latest_matches_set(conn: asyncpg.Connection) -> Optional[Tuple[int, int]]:
+    """
+    Возвращает (iso_year, week) самого свежего набора матчей, который есть в matches.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT iso_year, week
+        FROM matches
+        GROUP BY iso_year, week
+        ORDER BY iso_year DESC, week DESC
+        LIMIT 1
+        """
+    )
+    if not row:
+        return None
+    return int(row["iso_year"]), int(row["week"])
+
+
+async def latest_set_stats(conn: asyncpg.Connection, iso_year: int, week: int) -> Tuple[int, int]:
+    """
+    total = сколько матчей в наборе
+    missing = сколько матчей без результата
+    """
+    total = int(
+        await conn.fetchval(
+            "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2",
+            iso_year, week
+        )
+    )
+    missing = int(
+        await conn.fetchval(
+            "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2 AND result IS NULL",
+            iso_year, week
+        )
+    )
+    return total, missing
+
+
+# -------------------- BUSINESS --------------------
 def compute_points(actual: str, forecast: str) -> int:
     try:
         if actual.lower() == "тп":
@@ -311,8 +330,7 @@ async def broadcast_new_matches(bot: Bot, iso_year: int, week: int) -> None:
     async with db_pool.acquire() as conn:
         matches = await conn.fetch(
             """
-            SELECT match_name
-            FROM matches
+            SELECT match_name FROM matches
             WHERE iso_year=$1 AND week=$2
             ORDER BY match_index
             """,
@@ -337,10 +355,7 @@ async def clear_forecasts_for_week(iso_year: int, week: int) -> None:
     if db_pool is None:
         return
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM forecasts WHERE iso_year=$1 AND week=$2",
-            iso_year, week
-        )
+        await conn.execute("DELETE FROM forecasts WHERE iso_year=$1 AND week=$2", iso_year, week)
 
 
 # -------------------- USER HANDLERS --------------------
@@ -362,13 +377,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(RegisterStates.waiting_for_name)
 async def process_name(message: Message, state: FSMContext) -> None:
-    if db_pool is None:
-        await message.answer("База данных ещё не инициализирована, попробуйте позже.")
-        return
-
     name = (message.text or "").strip()
     if not name:
-        await message.answer("Имя не может быть пустым, введите другое.")
+        await message.answer("Имя не может быть пустым, введите другое")
         return
 
     async with db_pool.acquire() as conn:
@@ -379,13 +390,8 @@ async def process_name(message: Message, state: FSMContext) -> None:
 
         nickname = message.from_user.username if message.from_user.username else "ник скрыт"
         await conn.execute(
-            """
-            INSERT INTO users (telegram_id, name, nickname)
-            VALUES ($1, $2, $3)
-            """,
-            message.from_user.id,
-            name,
-            nickname,
+            "INSERT INTO users (telegram_id, name, nickname) VALUES ($1, $2, $3)",
+            message.from_user.id, name, nickname
         )
 
     await state.clear()
@@ -408,7 +414,7 @@ async def process_name(message: Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
-# Главное меню — только когда пользователь НЕ в FSM состоянии
+# меню — только когда нет FSM состояния
 @router.message(StateFilter(None), F.text.in_(ALL_BUTTONS))
 async def main_menu_handler(message: Message, state: FSMContext) -> None:
     text = message.text
@@ -451,9 +457,6 @@ async def fallback_text(message: Message) -> None:
 
 
 async def handle_my_profile(message: Message) -> None:
-    if db_pool is None:
-        return
-
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id=$1", message.from_user.id)
         if not user:
@@ -497,9 +500,6 @@ async def handle_make_forecast(message: Message, state: FSMContext) -> None:
         await message.answer("Прием прогнозов остановлен. Дождитесь вторника 18:00.")
         return
 
-    if db_pool is None:
-        return
-
     iso_year, week = current_isoyear_week()
 
     async with db_pool.acquire() as conn:
@@ -534,9 +534,6 @@ async def handle_make_forecast(message: Message, state: FSMContext) -> None:
 
 
 async def send_next_match(message: Message, state: FSMContext) -> None:
-    if db_pool is None:
-        return
-
     data = await state.get_data()
     iso_year = int(data["forecast_iso_year"])
     week = int(data["forecast_week"])
@@ -580,9 +577,6 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
         await message.answer("Неверный формат. Введите счет в формате '2-1'")
         return
 
-    if db_pool is None:
-        return
-
     data = await state.get_data()
     iso_year = int(data["forecast_iso_year"])
     week = int(data["forecast_week"])
@@ -594,11 +588,7 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
             INSERT INTO forecasts (telegram_id, iso_year, week, match_index, forecast)
             VALUES ($1, $2, $3, $4, $5)
             """,
-            message.from_user.id,
-            iso_year,
-            week,
-            current_match_index,
-            score,
+            message.from_user.id, iso_year, week, current_match_index, score
         )
 
     current_match_index += 1
@@ -607,9 +597,6 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
 
 
 async def handle_leaderboard(message: Message) -> None:
-    if db_pool is None:
-        return
-
     async with db_pool.acquire() as conn:
         top_rows = await conn.fetch(
             "SELECT telegram_id, name, points FROM users ORDER BY points DESC LIMIT 10"
@@ -640,13 +627,8 @@ async def handle_leaderboard(message: Message) -> None:
 
 
 async def handle_month_leaderboard(message: Message) -> None:
-    if db_pool is None:
-        return
-
     async with db_pool.acquire() as conn:
-        top_rows = await conn.fetch(
-            "SELECT name, points FROM monthleaders ORDER BY points DESC LIMIT 10"
-        )
+        top_rows = await conn.fetch("SELECT name, points FROM monthleaders ORDER BY points DESC LIMIT 10")
         if not top_rows:
             await message.answer("Месячная таблица лидеров пуста.")
             return
@@ -673,9 +655,6 @@ async def handle_month_leaderboard(message: Message) -> None:
 
 
 async def handle_view_forecast(message: Message) -> None:
-    if db_pool is None:
-        return
-
     iso_year, week = current_isoyear_week()
 
     async with db_pool.acquire() as conn:
@@ -688,9 +667,7 @@ async def handle_view_forecast(message: Message) -> None:
             WHERE f.telegram_id=$1 AND f.iso_year=$2 AND f.week=$3
             ORDER BY f.match_index
             """,
-            message.from_user.id,
-            iso_year,
-            week,
+            message.from_user.id, iso_year, week
         )
 
     if not rows:
@@ -702,21 +679,14 @@ async def handle_view_forecast(message: Message) -> None:
 
 
 async def handle_view_points(message: Message) -> None:
-    if db_pool is None:
-        return
-
     iso_year, week = previous_isoyear_week()
 
     async with db_pool.acquire() as conn:
         cnt = await conn.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM forecasts
-            WHERE telegram_id=$1 AND iso_year=$2 AND week=$3
-            """,
+            "SELECT COUNT(*) FROM forecasts WHERE telegram_id=$1 AND iso_year=$2 AND week=$3",
             message.from_user.id, iso_year, week
         )
-        if cnt == 0:
+        if int(cnt) == 0:
             await message.answer("Вы не делали прогноз на прошлой неделе")
             return
 
@@ -752,78 +722,24 @@ def _is_admin(message: Message) -> bool:
     return message.from_user.id in ADMIN_IDS
 
 
-async def admin_new_matches(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message):
-        await message.answer("Недостаточно прав.")
-        return
-
-    iso_year, week = current_isoyear_week()
-    await state.update_data(new_match_index=1, new_match_iso_year=iso_year, new_match_week=week)
-    await state.set_state(NewMatchesStates.waiting_for_match)
-    await message.answer("Введите название матча 1 из 10:")
-
-
-@router.message(NewMatchesStates.waiting_for_match)
-async def process_new_match(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message):
-        await message.answer("Недостаточно прав.")
-        return
-
-    match_name = (message.text or "").strip()
-    if not match_name:
-        await message.answer("Название матча не может быть пустым, введите ещё раз:")
-        return
-
-    if db_pool is None:
-        return
-
-    data = await state.get_data()
-    idx = int(data.get("new_match_index", 1))
-    iso_year = int(data["new_match_iso_year"])
-    week = int(data["new_match_week"])
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO matches (iso_year, week, match_index, match_name, result)
-            VALUES ($1, $2, $3, $4, NULL)
-            ON CONFLICT (iso_year, week, match_index)
-            DO UPDATE SET match_name=EXCLUDED.match_name, result=NULL
-            """,
-            iso_year, week, idx, match_name
-        )
-
-    if idx < 10:
-        idx += 1
-        await state.update_data(new_match_index=idx)
-        await message.answer(f"Готово, внесите следующий матч ({idx} из 10):")
-    else:
-        await message.answer("Готово, все матчи добавлены.")
-        await state.clear()
-
-        # как в оригинале: очищаем прогнозы этой недели, чтобы можно было ввести заново
-        await clear_forecasts_for_week(iso_year, week)
-
-        # рассылка
-        await broadcast_new_matches(message.bot, iso_year, week)
-
-
+# ✅ ПРАВКА #1: Внести результаты — ориентируемся на "нынешние матчи" (последний внесённый набор)
 async def admin_enter_results(message: Message, state: FSMContext) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
-    if db_pool is None:
-        return
-
-    iso_year, week = results_target_isoyear_week()
 
     async with db_pool.acquire() as conn:
-        cnt = await conn.fetchval(
-            "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2",
-            iso_year, week
-        )
-        if cnt == 0:
+        latest = await get_latest_matches_set(conn)
+        if not latest:
             await message.answer("Матчей еще нет")
+            return
+
+        iso_year, week = latest
+        total, _missing = await latest_set_stats(conn, iso_year, week)
+
+        # если набор не полный — лучше не начинать внесение результатов
+        if total < 10:
+            await message.answer("Матчи добавлены не полностью. Сначала внесите все 10 матчей.")
             return
 
     await state.update_data(result_index=1, result_iso_year=iso_year, result_week=week)
@@ -832,9 +748,6 @@ async def admin_enter_results(message: Message, state: FSMContext) -> None:
 
 
 async def send_result_entry(message: Message, state: FSMContext) -> None:
-    if db_pool is None:
-        return
-
     data = await state.get_data()
     idx = int(data.get("result_index", 1))
     iso_year = int(data["result_iso_year"])
@@ -876,9 +789,6 @@ async def process_result_entry(message: Message, state: FSMContext) -> None:
             await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
             return
 
-    if db_pool is None:
-        return
-
     data = await state.get_data()
     idx = int(data.get("result_index", 1))
     iso_year = int(data["result_iso_year"])
@@ -900,9 +810,6 @@ async def process_result_entry(message: Message, state: FSMContext) -> None:
 
 
 async def calculate_points_for_week(message: Message, iso_year: int, week: int) -> None:
-    if db_pool is None:
-        return
-
     async with db_pool.acquire() as conn:
         forecasts = await conn.fetch(
             """
@@ -945,30 +852,86 @@ async def calculate_points_for_week(message: Message, iso_year: int, week: int) 
             )
             if exists_ml:
                 await conn.execute(
-                    """
-                    UPDATE monthleaders
-                    SET points = points + $1, nickname=$2
-                    WHERE telegram_id=$3
-                    """,
+                    "UPDATE monthleaders SET points = points + $1, nickname=$2 WHERE telegram_id=$3",
                     points, user["nickname"], fc["telegram_id"]
                 )
             else:
                 await conn.execute(
-                    """
-                    INSERT INTO monthleaders (telegram_id, name, nickname, points)
-                    VALUES ($1, $2, $3, $4)
-                    """,
+                    "INSERT INTO monthleaders (telegram_id, name, nickname, points) VALUES ($1, $2, $3, $4)",
                     fc["telegram_id"], user["name"], user["nickname"], points
                 )
 
     await message.answer("Результаты внесены, таблица лидеров обновлена.")
 
 
-async def admin_publish_results(message: Message) -> None:
+# ✅ ПРАВКА #2: запрет "Внести новые матчи", если по прошлому набору не внесены результаты
+async def admin_new_matches(message: Message, state: FSMContext) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
-    if db_pool is None:
+
+    async with db_pool.acquire() as conn:
+        latest = await get_latest_matches_set(conn)
+        if latest:
+            iso_year_old, week_old = latest
+            total, missing = await latest_set_stats(conn, iso_year_old, week_old)
+
+            # блокируем только если есть полный набор (10) и хотя бы один результат не внесён
+            if total >= 10 and missing > 0:
+                await message.answer("Сначала внесите результаты по старым матчам")
+                return
+
+    iso_year, week = current_isoyear_week()
+    await state.update_data(new_match_index=1, new_match_iso_year=iso_year, new_match_week=week)
+    await state.set_state(NewMatchesStates.waiting_for_match)
+    await message.answer("Введите название матча 1 из 10:")
+
+
+@router.message(NewMatchesStates.waiting_for_match)
+async def process_new_match(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    match_name = (message.text or "").strip()
+    if not match_name:
+        await message.answer("Название матча не может быть пустым, введите ещё раз:")
+        return
+
+    data = await state.get_data()
+    idx = int(data.get("new_match_index", 1))
+    iso_year = int(data["new_match_iso_year"])
+    week = int(data["new_match_week"])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO matches (iso_year, week, match_index, match_name, result)
+            VALUES ($1, $2, $3, $4, NULL)
+            ON CONFLICT (iso_year, week, match_index)
+            DO UPDATE SET match_name=EXCLUDED.match_name, result=NULL
+            """,
+            iso_year, week, idx, match_name
+        )
+
+    if idx < 10:
+        idx += 1
+        await state.update_data(new_match_index=idx)
+        await message.answer(f"Готово, внесите следующий матч ({idx} из 10):")
+    else:
+        await message.answer("Готово, все матчи добавлены.")
+        await state.clear()
+
+        # как в исходной логике: очищаем прогнозы этой недели, чтобы могли ввести новые
+        await clear_forecasts_for_week(iso_year, week)
+
+        # рассылка
+        await broadcast_new_matches(message.bot, iso_year, week)
+
+
+async def admin_publish_results(message: Message) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
         return
 
     async with db_pool.acquire() as conn:
@@ -1006,8 +969,6 @@ async def process_delete_tables_confirmation(message: Message, state: FSMContext
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
-    if db_pool is None:
-        return
 
     if (message.text or "").strip().lower() == "да":
         async with db_pool.acquire() as conn:
@@ -1016,7 +977,6 @@ async def process_delete_tables_confirmation(message: Message, state: FSMContext
             await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
 
-            # удалить legacy-таблицы, если были
             legacy = await conn.fetch(
                 """
                 SELECT tablename
@@ -1040,8 +1000,6 @@ async def handle_admin_table(message: Message) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
-    if db_pool is None:
-        return
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT telegram_id, name, nickname, points FROM users ORDER BY points DESC")
@@ -1063,8 +1021,6 @@ async def handle_month_admin_table(message: Message) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
-    if db_pool is None:
-        return
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT telegram_id, name, nickname, points FROM monthleaders ORDER BY points DESC")
@@ -1085,6 +1041,7 @@ async def handle_month_admin_table(message: Message) -> None:
 # -------------------- MAIN --------------------
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+
     await init_db()
 
     bot = Bot(
@@ -1094,7 +1051,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # чтобы polling не конфликтовал с возможным старым webhook
+    # чтобы polling не конфликтовал с webhook
     await bot.delete_webhook(drop_pending_updates=True)
 
     try:
