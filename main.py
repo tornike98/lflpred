@@ -50,6 +50,7 @@ MENU_BUTTONS = [
 ]
 ADMIN_BUTTONS = [
     "Внести результаты",
+    "Изменить результаты",
     "Внести новые матчи",
     "Опубликовать результаты",
     "Удалить все таблицы",
@@ -101,14 +102,11 @@ def is_forecast_open() -> bool:
     weekday = t.weekday()  # Пн=0..Вс=6
     current_time = t.time()
 
-    # вторник — с 18:00
-    if weekday == 1:
+    if weekday == 1:  # вторник
         return current_time >= time(18, 0)
-    # пятница — до 21:00
-    elif weekday == 4:
+    elif weekday == 4:  # пятница
         return current_time < time(21, 0)
-    # среда/четверг — открыто
-    elif weekday in (2, 3):
+    elif weekday in (2, 3):  # среда/четверг
         return True
     return False
 
@@ -170,7 +168,7 @@ class RegistrationCheckMiddleware(BaseMiddleware):
 router.message.middleware(RegistrationCheckMiddleware())
 
 
-# -------------------- DB (with safe migration) --------------------
+# -------------------- DB INIT (safe migration) --------------------
 async def _maybe_rename_legacy(conn: asyncpg.Connection, table: str, required_cols: set[str]) -> None:
     reg = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
     if not reg:
@@ -222,7 +220,7 @@ async def init_db() -> None:
             """
         )
 
-        # если в БД остались старые matches/forecasts без iso_year/week — переименуем их
+        # Если раньше были таблицы без iso_year/week — переименуем и создадим новые
         await _maybe_rename_legacy(conn, "matches", {"iso_year", "week", "match_index", "match_name"})
         await _maybe_rename_legacy(conn, "forecasts", {"iso_year", "week", "match_index", "telegram_id", "forecast"})
 
@@ -254,12 +252,39 @@ async def init_db() -> None:
             """
         )
 
+        # Маркер: "по этому набору матчей очки уже начислены"
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS points_applied (
+                iso_year INTEGER NOT NULL,
+                week INTEGER NOT NULL,
+                applied_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (iso_year, week)
+            );
+            """
+        )
 
-# -------------------- ADMIN HELPERS (NEW) --------------------
+        # Леджер очков по каждому матчу (для точного отката)
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS match_points (
+                iso_year INTEGER NOT NULL,
+                week INTEGER NOT NULL,
+                telegram_id BIGINT NOT NULL,
+                match_index INTEGER NOT NULL,
+                points INTEGER NOT NULL,
+                PRIMARY KEY (iso_year, week, telegram_id, match_index)
+            );
+            """
+        )
+
+
+# -------------------- ADMIN HELPERS --------------------
+def _is_admin(message: Message) -> bool:
+    return message.from_user.id in ADMIN_IDS
+
+
 async def get_latest_matches_set(conn: asyncpg.Connection) -> Optional[Tuple[int, int]]:
-    """
-    Возвращает (iso_year, week) самого свежего набора матчей, который есть в matches.
-    """
     row = await conn.fetchrow(
         """
         SELECT iso_year, week
@@ -274,24 +299,36 @@ async def get_latest_matches_set(conn: asyncpg.Connection) -> Optional[Tuple[int
     return int(row["iso_year"]), int(row["week"])
 
 
-async def latest_set_stats(conn: asyncpg.Connection, iso_year: int, week: int) -> Tuple[int, int]:
-    """
-    total = сколько матчей в наборе
-    missing = сколько матчей без результата
-    """
-    total = int(
-        await conn.fetchval(
-            "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2",
-            iso_year, week
-        )
+async def get_latest_applied_set(conn: asyncpg.Connection) -> Optional[Tuple[int, int]]:
+    row = await conn.fetchrow(
+        """
+        SELECT iso_year, week
+        FROM points_applied
+        ORDER BY iso_year DESC, week DESC
+        LIMIT 1
+        """
     )
-    missing = int(
-        await conn.fetchval(
-            "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2 AND result IS NULL",
-            iso_year, week
-        )
-    )
+    if not row:
+        return None
+    return int(row["iso_year"]), int(row["week"])
+
+
+async def set_stats(conn: asyncpg.Connection, iso_year: int, week: int) -> Tuple[int, int]:
+    total = int(await conn.fetchval("SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2", iso_year, week))
+    missing = int(await conn.fetchval(
+        "SELECT COUNT(*) FROM matches WHERE iso_year=$1 AND week=$2 AND result IS NULL", iso_year, week
+    ))
     return total, missing
+
+
+async def is_applied(conn: asyncpg.Connection, iso_year: int, week: int) -> bool:
+    v = await conn.fetchval("SELECT 1 FROM points_applied WHERE iso_year=$1 AND week=$2", iso_year, week)
+    return v is not None
+
+
+async def clear_applied_markers(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
+    await conn.execute("DELETE FROM points_applied WHERE iso_year=$1 AND week=$2", iso_year, week)
+    await conn.execute("DELETE FROM match_points WHERE iso_year=$1 AND week=$2", iso_year, week)
 
 
 # -------------------- BUSINESS --------------------
@@ -324,9 +361,6 @@ def compute_points(actual: str, forecast: str) -> int:
 
 
 async def broadcast_new_matches(bot: Bot, iso_year: int, week: int) -> None:
-    if db_pool is None:
-        return
-
     async with db_pool.acquire() as conn:
         matches = await conn.fetch(
             """
@@ -352,19 +386,123 @@ async def broadcast_new_matches(bot: Bot, iso_year: int, week: int) -> None:
 
 
 async def clear_forecasts_for_week(iso_year: int, week: int) -> None:
-    if db_pool is None:
-        return
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM forecasts WHERE iso_year=$1 AND week=$2", iso_year, week)
+
+
+async def apply_points_for_week(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
+    # Не начисляем дважды
+    if await is_applied(conn, iso_year, week):
+        return
+
+    matches = await conn.fetch(
+        "SELECT match_index, result FROM matches WHERE iso_year=$1 AND week=$2",
+        iso_year, week
+    )
+    results_by_idx = {int(m["match_index"]): m["result"] for m in matches}
+
+    forecasts = await conn.fetch(
+        """
+        SELECT telegram_id, match_index, forecast
+        FROM forecasts
+        WHERE iso_year=$1 AND week=$2
+        """,
+        iso_year, week
+    )
+
+    totals: dict[int, int] = {}  # telegram_id -> total points for this set
+
+    for fc in forecasts:
+        tid = int(fc["telegram_id"])
+        midx = int(fc["match_index"])
+        forecast = str(fc["forecast"])
+        actual = results_by_idx.get(midx)
+
+        if not actual:
+            continue
+
+        pts = compute_points(str(actual), forecast)
+
+        await conn.execute(
+            """
+            INSERT INTO match_points (iso_year, week, telegram_id, match_index, points)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (iso_year, week, telegram_id, match_index)
+            DO UPDATE SET points=EXCLUDED.points
+            """,
+            iso_year, week, tid, midx, pts
+        )
+
+        totals[tid] = totals.get(tid, 0) + pts
+
+    # Даже если никто не прогнозировал — блокируем повторное начисление
+    await conn.execute(
+        "INSERT INTO points_applied (iso_year, week) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        iso_year, week
+    )
+
+    if not totals:
+        return
+
+    tids = list(totals.keys())
+    users = await conn.fetch(
+        "SELECT telegram_id, name, nickname FROM users WHERE telegram_id = ANY($1::bigint[])",
+        tids
+    )
+    user_map = {int(u["telegram_id"]): (str(u["name"]), str(u["nickname"])) for u in users}
+
+    for tid, pts in totals.items():
+        await conn.execute(
+            "UPDATE users SET points = points + $1 WHERE telegram_id=$2",
+            pts, tid
+        )
+
+        name, nickname = user_map.get(tid, ("", ""))
+        exists_ml = await conn.fetchval("SELECT 1 FROM monthleaders WHERE telegram_id=$1", tid)
+        if exists_ml:
+            await conn.execute(
+                "UPDATE monthleaders SET points = points + $1, nickname=$2 WHERE telegram_id=$3",
+                pts, nickname, tid
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO monthleaders (telegram_id, name, nickname, points) VALUES ($1, $2, $3, $4)",
+                tid, name, nickname, pts
+            )
+
+
+async def rollback_points_for_week(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT telegram_id, SUM(points)::int AS pts
+        FROM match_points
+        WHERE iso_year=$1 AND week=$2
+        GROUP BY telegram_id
+        """,
+        iso_year, week
+    )
+
+    for r in rows:
+        tid = int(r["telegram_id"])
+        pts = int(r["pts"] or 0)
+        if pts == 0:
+            continue
+
+        await conn.execute(
+            "UPDATE users SET points = GREATEST(points - $1, 0) WHERE telegram_id=$2",
+            pts, tid
+        )
+        await conn.execute(
+            "UPDATE monthleaders SET points = GREATEST(points - $1, 0) WHERE telegram_id=$2",
+            pts, tid
+        )
+
+    await clear_applied_markers(conn, iso_year, week)
 
 
 # -------------------- USER HANDLERS --------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    if db_pool is None:
-        await message.answer("База данных ещё не инициализирована, попробуйте позже.")
-        return
-
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT 1 FROM users WHERE telegram_id=$1", message.from_user.id)
 
@@ -437,6 +575,8 @@ async def main_menu_handler(message: Message, state: FSMContext) -> None:
         await handle_view_points(message)
     elif text == "Внести результаты":
         await admin_enter_results(message, state)
+    elif text == "Изменить результаты":
+        await admin_edit_results(message, state)
     elif text == "Внести новые матчи":
         await admin_new_matches(message, state)
     elif text == "Опубликовать результаты":
@@ -596,6 +736,30 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
     await send_next_match(message, state)
 
 
+async def handle_view_forecast(message: Message) -> None:
+    iso_year, week = current_isoyear_week()
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT m.match_name, f.forecast
+            FROM forecasts f
+            JOIN matches m
+              ON m.iso_year=f.iso_year AND m.week=f.week AND m.match_index=f.match_index
+            WHERE f.telegram_id=$1 AND f.iso_year=$2 AND f.week=$3
+            ORDER BY f.match_index
+            """,
+            message.from_user.id, iso_year, week
+        )
+
+    if not rows:
+        await message.answer("Прогноз не найден")
+        return
+
+    response = "\n".join(f"{r['match_name']} {r['forecast']}" for r in rows)
+    await message.answer(response)
+
+
 async def handle_leaderboard(message: Message) -> None:
     async with db_pool.acquire() as conn:
         top_rows = await conn.fetch(
@@ -654,40 +818,28 @@ async def handle_month_leaderboard(message: Message) -> None:
     await message.answer(response)
 
 
-async def handle_view_forecast(message: Message) -> None:
-    iso_year, week = current_isoyear_week()
-
+async def handle_view_points(message: Message) -> None:
+    """
+    Показывает очки по ПОСЛЕДНЕМУ набору матчей, по которому уже начислялись очки.
+    """
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
+        applied_set = await get_latest_applied_set(conn)
+        if not applied_set:
+            await message.answer("Пока нет данных для отображения — результаты еще не внесены.")
+            return
+
+        iso_year, week = applied_set
+
+        cnt = await conn.fetchval(
             """
-            SELECT m.match_name, f.forecast
-            FROM forecasts f
-            JOIN matches m
-              ON m.iso_year=f.iso_year AND m.week=f.week AND m.match_index=f.match_index
-            WHERE f.telegram_id=$1 AND f.iso_year=$2 AND f.week=$3
-            ORDER BY f.match_index
+            SELECT COUNT(*)
+            FROM forecasts
+            WHERE telegram_id=$1 AND iso_year=$2 AND week=$3
             """,
             message.from_user.id, iso_year, week
         )
-
-    if not rows:
-        await message.answer("Прогноз не найден")
-        return
-
-    response = "\n".join(f"{r['match_name']} {r['forecast']}" for r in rows)
-    await message.answer(response)
-
-
-async def handle_view_points(message: Message) -> None:
-    iso_year, week = previous_isoyear_week()
-
-    async with db_pool.acquire() as conn:
-        cnt = await conn.fetchval(
-            "SELECT COUNT(*) FROM forecasts WHERE telegram_id=$1 AND iso_year=$2 AND week=$3",
-            message.from_user.id, iso_year, week
-        )
         if int(cnt) == 0:
-            await message.answer("Вы не делали прогноз на прошлой неделе")
+            await message.answer("Вы не делали прогноз на этих матчах")
             return
 
         rows = await conn.fetch(
@@ -708,7 +860,7 @@ async def handle_view_points(message: Message) -> None:
 
     response_lines = []
     for idx, row in enumerate(rows, start=1):
-        points = compute_points(row["result"], row["forecast"])
+        points = compute_points(str(row["result"]), str(row["forecast"]))
         response_lines.append(
             f"{idx}. <b>{row['match_name']} {row['result']}</b>\n"
             f"Ваш прогноз {row['forecast']} ({points} очков)"
@@ -718,153 +870,6 @@ async def handle_view_points(message: Message) -> None:
 
 
 # -------------------- ADMIN HANDLERS --------------------
-def _is_admin(message: Message) -> bool:
-    return message.from_user.id in ADMIN_IDS
-
-
-# ✅ ПРАВКА #1: Внести результаты — ориентируемся на "нынешние матчи" (последний внесённый набор)
-async def admin_enter_results(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message):
-        await message.answer("Недостаточно прав.")
-        return
-
-    async with db_pool.acquire() as conn:
-        latest = await get_latest_matches_set(conn)
-        if not latest:
-            await message.answer("Матчей еще нет")
-            return
-
-        iso_year, week = latest
-        total, _missing = await latest_set_stats(conn, iso_year, week)
-
-        # если набор не полный — лучше не начинать внесение результатов
-        if total < 10:
-            await message.answer("Матчи добавлены не полностью. Сначала внесите все 10 матчей.")
-            return
-
-    await state.update_data(result_index=1, result_iso_year=iso_year, result_week=week)
-    await state.set_state(EnterResultsStates.waiting_for_result)
-    await send_result_entry(message, state)
-
-
-async def send_result_entry(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    idx = int(data.get("result_index", 1))
-    iso_year = int(data["result_iso_year"])
-    week = int(data["result_week"])
-
-    async with db_pool.acquire() as conn:
-        match = await conn.fetchrow(
-            """
-            SELECT match_name
-            FROM matches
-            WHERE iso_year=$1 AND week=$2 AND match_index=$3
-            """,
-            iso_year, week, idx
-        )
-
-    if match:
-        await message.answer(
-            f"Введите результат для матча {idx}: {match['match_name']} (в формате '3-4' или 'тп')"
-        )
-    else:
-        await calculate_points_for_week(message, iso_year, week)
-        await message.answer("Внесите новые матчи, нажав кнопку 'Внести новые матчи'")
-        await state.clear()
-
-
-@router.message(EnterResultsStates.waiting_for_result)
-async def process_result_entry(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message):
-        await message.answer("Недостаточно прав.")
-        return
-
-    result = (message.text or "").strip().lower()
-    if result != "тп":
-        if result.count("-") != 1:
-            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
-            return
-        a, b = result.split("-", 1)
-        if not (a.isdigit() and b.isdigit()):
-            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
-            return
-
-    data = await state.get_data()
-    idx = int(data.get("result_index", 1))
-    iso_year = int(data["result_iso_year"])
-    week = int(data["result_week"])
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE matches
-            SET result=$1
-            WHERE iso_year=$2 AND week=$3 AND match_index=$4
-            """,
-            result, iso_year, week, idx
-        )
-
-    idx += 1
-    await state.update_data(result_index=idx)
-    await send_result_entry(message, state)
-
-
-async def calculate_points_for_week(message: Message, iso_year: int, week: int) -> None:
-    async with db_pool.acquire() as conn:
-        forecasts = await conn.fetch(
-            """
-            SELECT telegram_id, match_index, forecast
-            FROM forecasts
-            WHERE iso_year=$1 AND week=$2
-            """,
-            iso_year, week
-        )
-
-        for fc in forecasts:
-            match = await conn.fetchrow(
-                """
-                SELECT result
-                FROM matches
-                WHERE iso_year=$1 AND week=$2 AND match_index=$3
-                """,
-                iso_year, week, fc["match_index"]
-            )
-            if not (match and match["result"]):
-                continue
-
-            points = compute_points(match["result"], fc["forecast"])
-
-            await conn.execute(
-                "UPDATE users SET points = points + $1 WHERE telegram_id=$2",
-                points, fc["telegram_id"]
-            )
-
-            user = await conn.fetchrow(
-                "SELECT name, nickname FROM users WHERE telegram_id=$1",
-                fc["telegram_id"]
-            )
-            if not user:
-                continue
-
-            exists_ml = await conn.fetchval(
-                "SELECT 1 FROM monthleaders WHERE telegram_id=$1",
-                fc["telegram_id"]
-            )
-            if exists_ml:
-                await conn.execute(
-                    "UPDATE monthleaders SET points = points + $1, nickname=$2 WHERE telegram_id=$3",
-                    points, user["nickname"], fc["telegram_id"]
-                )
-            else:
-                await conn.execute(
-                    "INSERT INTO monthleaders (telegram_id, name, nickname, points) VALUES ($1, $2, $3, $4)",
-                    fc["telegram_id"], user["name"], user["nickname"], points
-                )
-
-    await message.answer("Результаты внесены, таблица лидеров обновлена.")
-
-
-# ✅ ПРАВКА #2: запрет "Внести новые матчи", если по прошлому набору не внесены результаты
 async def admin_new_matches(message: Message, state: FSMContext) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
@@ -874,9 +879,9 @@ async def admin_new_matches(message: Message, state: FSMContext) -> None:
         latest = await get_latest_matches_set(conn)
         if latest:
             iso_year_old, week_old = latest
-            total, missing = await latest_set_stats(conn, iso_year_old, week_old)
+            total, missing = await set_stats(conn, iso_year_old, week_old)
 
-            # блокируем только если есть полный набор (10) и хотя бы один результат не внесён
+            # Блокируем только когда набор полный (10) и есть хоть 1 матч без результата
             if total >= 10 and missing > 0:
                 await message.answer("Сначала внесите результаты по старым матчам")
                 return
@@ -918,15 +923,149 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
         idx += 1
         await state.update_data(new_match_index=idx)
         await message.answer(f"Готово, внесите следующий матч ({idx} из 10):")
-    else:
-        await message.answer("Готово, все матчи добавлены.")
-        await state.clear()
+        return
 
-        # как в исходной логике: очищаем прогнозы этой недели, чтобы могли ввести новые
-        await clear_forecasts_for_week(iso_year, week)
+    # 10/10
+    await message.answer("Готово, все матчи добавлены.")
+    await state.clear()
 
-        # рассылка
-        await broadcast_new_matches(message.bot, iso_year, week)
+    # ВАЖНО: это "новый" набор матчей => разрешаем новый ввод результатов
+    # (если в эту же iso-неделю уже когда-то начисляли, очищаем маркеры и леджер)
+    async with db_pool.acquire() as conn:
+        await clear_applied_markers(conn, iso_year, week)
+
+    # как в исходной логике: очищаем прогнозы этой недели, чтобы могли ввести новые
+    await clear_forecasts_for_week(iso_year, week)
+
+    # рассылка
+    await broadcast_new_matches(message.bot, iso_year, week)
+
+
+async def admin_enter_results(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    async with db_pool.acquire() as conn:
+        latest = await get_latest_matches_set(conn)
+        if not latest:
+            await message.answer("Матчей еще нет")
+            return
+
+        iso_year, week = latest
+        total, missing = await set_stats(conn, iso_year, week)
+
+        if total < 10:
+            await message.answer("Матчи добавлены не полностью. Сначала внесите все 10 матчей.")
+            return
+
+        # Если очки уже начислены — повторно вносить нельзя
+        if await is_applied(conn, iso_year, week):
+            await message.answer("Результаты уже внесены. Используйте кнопку «Изменить результаты».")
+            return
+
+        await state.update_data(result_index=1, result_iso_year=iso_year, result_week=week, edit_mode=False)
+
+    await state.set_state(EnterResultsStates.waiting_for_result)
+    await send_result_entry(message, state)
+
+
+async def admin_edit_results(message: Message, state: FSMContext) -> None:
+    """
+    Откатить очки за текущие матчи и дать ввести результаты заново.
+    Если результаты ещё не были внесены/начислены — "Новые результаты еще не внесены".
+    """
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    async with db_pool.acquire() as conn:
+        latest = await get_latest_matches_set(conn)
+        if not latest:
+            await message.answer("Матчей еще нет")
+            return
+
+        iso_year, week = latest
+        if not await is_applied(conn, iso_year, week):
+            await message.answer("Новые результаты еще не внесены")
+            return
+
+        # откат очков за этот набор
+        await rollback_points_for_week(conn, iso_year, week)
+
+        # после отката даём внести результаты заново
+        await state.update_data(result_index=1, result_iso_year=iso_year, result_week=week, edit_mode=True)
+
+    await state.set_state(EnterResultsStates.waiting_for_result)
+    await message.answer("Ок. Введите результаты заново (1–10).")
+    await send_result_entry(message, state)
+
+
+async def send_result_entry(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    idx = int(data.get("result_index", 1))
+    iso_year = int(data["result_iso_year"])
+    week = int(data["result_week"])
+
+    async with db_pool.acquire() as conn:
+        match = await conn.fetchrow(
+            """
+            SELECT match_name
+            FROM matches
+            WHERE iso_year=$1 AND week=$2 AND match_index=$3
+            """,
+            iso_year, week, idx
+        )
+
+    if match:
+        await message.answer(
+            f"Введите результат для матча {idx}: {match['match_name']} (в формате '3-4' или 'тп')"
+        )
+        return
+
+    # Если матчей с таким индексом нет — считаем, что ввод закончен
+    async with db_pool.acquire() as conn:
+        await apply_points_for_week(conn, iso_year, week)
+
+    await message.answer("Готово. Очки пересчитаны и таблицы обновлены.")
+    await state.clear()
+    await send_main_menu(message)
+
+
+@router.message(EnterResultsStates.waiting_for_result)
+async def process_result_entry(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    result = (message.text or "").strip().lower()
+    if result != "тп":
+        if result.count("-") != 1:
+            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
+            return
+        a, b = result.split("-", 1)
+        if not (a.isdigit() and b.isdigit()):
+            await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
+            return
+
+    data = await state.get_data()
+    idx = int(data.get("result_index", 1))
+    iso_year = int(data["result_iso_year"])
+    week = int(data["result_week"])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE matches
+            SET result=$1
+            WHERE iso_year=$2 AND week=$3 AND match_index=$4
+            """,
+            result, iso_year, week, idx
+        )
+
+    idx += 1
+    await state.update_data(result_index=idx)
+    await send_result_entry(message, state)
 
 
 async def admin_publish_results(message: Message) -> None:
@@ -972,6 +1111,8 @@ async def process_delete_tables_confirmation(message: Message, state: FSMContext
 
     if (message.text or "").strip().lower() == "да":
         async with db_pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS match_points CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS points_applied CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS forecasts CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS matches CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
@@ -1051,7 +1192,6 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # чтобы polling не конфликтовал с webhook
     await bot.delete_webhook(drop_pending_updates=True)
 
     try:
