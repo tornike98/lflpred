@@ -577,7 +577,6 @@ async def process_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Укажите название вашей команды.\n"
         f"Если вы не являетесь членом команды, укажите «{FAN_TEAM}».\n\n"
-        "Допустимые команды:\n"
     )
     await state.set_state(RegisterStates.waiting_for_team)
 
