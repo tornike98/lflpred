@@ -58,13 +58,13 @@ TEAM_MAP.update({_norm_team(t): t for t in TEAMS})
 
 # ==================== HTML ESCAPE ====================
 def html_escape(s: str) -> str:
-    s = s if s is not None else ""
+    s = "" if s is None else str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ==================== PROFANITY FILTER (ONLY MAT, >=4 letters) ====================
-# Только мат/обсценная лексика (без оскорблений).
-# Проверяем по словам, игнорируем токены короче 4. Короткие корни типа "еб" не используем.
+# Только мат/обсценная лексика (без оскорблений). Проверяем по словам, токены <4 игнорируем.
+# Короткие корни типа "еб" НЕ используем.
 
 MAT_PREFIXES_4PLUS = {
     "бляд", "блят",
@@ -113,7 +113,6 @@ _MAT_WORDS_N = {w.casefold().replace("ё", "е") for w in MAT_WORDS_EXACT_4PLUS 
 
 
 def contains_profanity_or_insult(text: str) -> bool:
-    """Проверяет только мат/обсценную лексику."""
     t = _norm_text_for_filter(text)
     if not t:
         return False
@@ -152,6 +151,10 @@ ADMIN_BUTTONS = [
     "Забанить пользователя",
     "Разблокировать пользователя",
     "Черный список",
+    "Открыть прием прогнозов",
+    "Закрыть прием прогнозов",
+    "Авто прием прогнозов",
+    "Отправить сообщение",
 ]
 ALL_BUTTONS = MENU_BUTTONS + ADMIN_BUTTONS
 
@@ -190,6 +193,11 @@ class UnbanStates(StatesGroup):
     waiting_for_team = State()
 
 
+class BroadcastStates(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_confirmation = State()
+
+
 # ==================== TIME HELPERS ====================
 def moscow_now() -> datetime:
     return datetime.now(MOSCOW_TZ)
@@ -200,7 +208,7 @@ def current_isoyear_week() -> Tuple[int, int]:
     return int(iso.year), int(iso.week)
 
 
-def is_forecast_open() -> bool:
+def is_forecast_open_schedule() -> bool:
     t = moscow_now()
     weekday = t.weekday()  # Пн=0..Вс=6
     current_time = t.time()
@@ -237,7 +245,7 @@ async def send_main_menu(message: Message) -> None:
     await message.answer("Выберите действие:", reply_markup=build_main_menu(message.from_user.id))
 
 
-# ==================== DB INIT (safe migration) ====================
+# ==================== DB INIT ====================
 async def _maybe_rename_legacy(conn: asyncpg.Connection, table: str, required_cols: set[str]) -> None:
     reg = await conn.fetchval("SELECT to_regclass($1)", f"public.{table}")
     if not reg:
@@ -265,7 +273,6 @@ async def init_db() -> None:
     )
 
     async with db_pool.acquire() as conn:
-        # users + team
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -278,10 +285,9 @@ async def init_db() -> None:
             );
             """
         )
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS team TEXT;")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT;")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS team TEXT;")
 
-        # monthleaders + team
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS monthleaders (
@@ -294,10 +300,9 @@ async def init_db() -> None:
             );
             """
         )
-        await conn.execute("ALTER TABLE monthleaders ADD COLUMN IF NOT EXISTS team TEXT;")
         await conn.execute("ALTER TABLE monthleaders ADD COLUMN IF NOT EXISTS nickname TEXT;")
+        await conn.execute("ALTER TABLE monthleaders ADD COLUMN IF NOT EXISTS team TEXT;")
 
-        # matches/forecasts
         await _maybe_rename_legacy(conn, "matches", {"iso_year", "week", "match_index", "match_name"})
         await _maybe_rename_legacy(conn, "forecasts", {"iso_year", "week", "match_index", "telegram_id", "forecast"})
 
@@ -329,7 +334,6 @@ async def init_db() -> None:
             """
         )
 
-        # idempotent apply marker + ledger for rollback
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS points_applied (
@@ -354,7 +358,6 @@ async def init_db() -> None:
             """
         )
 
-        # BLACKLIST
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS blacklist (
@@ -366,6 +369,24 @@ async def init_db() -> None:
             """
         )
 
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forecast_control (
+                id SMALLINT PRIMARY KEY,
+                mode TEXT NOT NULL CHECK (mode IN ('auto','open','closed')),
+                updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                updated_by BIGINT
+            );
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO forecast_control (id, mode)
+            VALUES (1, 'auto')
+            ON CONFLICT (id) DO NOTHING;
+            """
+        )
+
 
 # ==================== HELPERS ====================
 def _is_admin(message: Message) -> bool:
@@ -373,11 +394,6 @@ def _is_admin(message: Message) -> bool:
 
 
 def nickname_from_message(message: Message) -> str:
-    """
-    Берём username из message.from_user.username.
-    Если нет — 'ник скрыт'.
-    Если username содержит мат — тоже 'ник скрыт' (чтобы не светить).
-    """
     username = getattr(message.from_user, "username", None)
     if not username:
         return "ник скрыт"
@@ -387,12 +403,6 @@ def nickname_from_message(message: Message) -> str:
 
 
 async def sync_nickname_if_registered(conn: asyncpg.Connection, telegram_id: int, nickname: str) -> None:
-    """
-    Обновляет nickname в users и monthleaders.
-    Это обеспечивает:
-    - если пользователь скрыл username -> ставим 'ник скрыт'
-    - если открыл -> обновим на актуальный username
-    """
     await conn.execute("UPDATE users SET nickname=$1 WHERE telegram_id=$2", nickname, telegram_id)
     await conn.execute("UPDATE monthleaders SET nickname=$1 WHERE telegram_id=$2", nickname, telegram_id)
 
@@ -444,7 +454,36 @@ async def clear_applied_markers(conn: asyncpg.Connection, iso_year: int, week: i
     await conn.execute("DELETE FROM match_points WHERE iso_year=$1 AND week=$2", iso_year, week)
 
 
-# ==================== MIDDLEWARE (registration + blacklist + nickname sync) ====================
+async def get_forecast_mode(conn: asyncpg.Connection) -> str:
+    mode = await conn.fetchval("SELECT mode FROM forecast_control WHERE id=1")
+    return (mode or "auto").lower()
+
+
+async def set_forecast_mode(conn: asyncpg.Connection, mode: str, updated_by: int) -> None:
+    mode = mode.lower()
+    if mode not in ("auto", "open", "closed"):
+        mode = "auto"
+    await conn.execute(
+        """
+        UPDATE forecast_control
+        SET mode=$1, updated_at=NOW(), updated_by=$2
+        WHERE id=1
+        """,
+        mode, updated_by
+    )
+
+
+async def is_forecast_open_effective() -> bool:
+    async with db_pool.acquire() as conn:
+        mode = await get_forecast_mode(conn)
+    if mode == "open":
+        return True
+    if mode == "closed":
+        return False
+    return is_forecast_open_schedule()
+
+
+# ==================== MIDDLEWARE ====================
 class RegistrationCheckMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -458,21 +497,20 @@ class RegistrationCheckMiddleware(BaseMiddleware):
 
         # Админов не баним и пропускаем всегда
         if event.from_user and event.from_user.id in ADMIN_IDS:
-            # но если админ зарегистрирован в users — синхронизируем никнейм
             async with db_pool.acquire() as conn:
                 exists = await conn.fetchval("SELECT 1 FROM users WHERE telegram_id=$1", event.from_user.id)
                 if exists:
                     await sync_nickname_if_registered(conn, event.from_user.id, nickname_from_message(event))
             return await handler(event, data)
 
-        # Сначала проверка blacklist (даже для /start)
+        # Проверка blacklist (даже для /start)
         async with db_pool.acquire() as conn:
             banned = await conn.fetchval("SELECT 1 FROM blacklist WHERE telegram_id=$1", event.from_user.id)
         if banned:
             await event.answer("Ваш аккаунт заблокирован, вы не можете участвовать в конкурсе")
             return
 
-        # Если пользователь уже зарегистрирован — синхронизируем ник в users/monthleaders
+        # Синхронизация никнейма для зарегистрированных (обновление "ник скрыт" <-> username)
         async with db_pool.acquire() as conn:
             exists = await conn.fetchval("SELECT 1 FROM users WHERE telegram_id=$1", event.from_user.id)
             if exists:
@@ -561,7 +599,6 @@ async def clear_forecasts_for_week(iso_year: int, week: int) -> None:
 
 
 async def apply_points_for_week(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
-    # prevent double apply
     if await is_applied(conn, iso_year, week):
         return
 
@@ -620,7 +657,10 @@ async def apply_points_for_week(conn: asyncpg.Connection, iso_year: int, week: i
         "SELECT telegram_id, name, nickname, team FROM users WHERE telegram_id = ANY($1::bigint[])",
         tids
     )
-    user_map = {int(u["telegram_id"]): (str(u["name"]), str(u["nickname"] or "ник скрыт"), (u["team"] or "")) for u in users}
+    user_map = {
+        int(u["telegram_id"]): (str(u["name"]), str(u["nickname"] or "ник скрыт"), (u["team"] or ""))
+        for u in users
+    }
 
     for tid, pts in totals.items():
         await conn.execute("UPDATE users SET points = points + $1 WHERE telegram_id=$2", pts, tid)
@@ -696,6 +736,9 @@ async def process_name(message: Message, state: FSMContext) -> None:
     await message.answer(
         "Укажите название вашей команды.\n"
         f"Если вы не являетесь членом команды, укажите «{FAN_TEAM}».\n\n"
+        "Допустимые команды:\n"
+        + "\n".join(TEAMS)
+        + f"\n\nИли: {FAN_TEAM}"
     )
     await state.set_state(RegisterStates.waiting_for_team)
 
@@ -716,7 +759,6 @@ async def process_team(message: Message, state: FSMContext) -> None:
     nickname = nickname_from_message(message)
 
     async with db_pool.acquire() as conn:
-        # double-check uniqueness
         existing = await conn.fetchval("SELECT 1 FROM users WHERE name=$1", name)
         if existing:
             await message.answer("Имя уже занято, введите другое имя через /start")
@@ -741,7 +783,8 @@ async def process_team(message: Message, state: FSMContext) -> None:
         "   - 3 очка за угаданный исход и разницу мячей;\n"
         "   - 1 очко за угаданный исход матча.\n"
         "5. Таблица лидеров обновляется после внесения результатов администратором.\n"
-        "6. Если матч не состоялся или одной из команд присвоен статус 'Техническое поражение', пользователи не получают очки.\n"
+        "6. В случае нарушения правил или использования неподобающих никнеймов, пользователь попадает в бан.\n"
+        "7. Если матч не состоялся или одной из команд присвоен статус 'Техническое поражение', пользователи не получают очки.\n"
         "Удачи!"
     )
     await message.answer(rules_text)
@@ -795,6 +838,19 @@ async def main_menu_handler(message: Message, state: FSMContext) -> None:
         await admin_blacklist_show(message)
     elif text == "Разблокировать пользователя":
         await admin_unban_start(message, state)
+
+    # FORECAST CONTROL
+    elif text == "Открыть прием прогнозов":
+        await admin_set_forecast_mode_button(message, "open")
+    elif text == "Закрыть прием прогнозов":
+        await admin_set_forecast_mode_button(message, "closed")
+    elif text == "Авто прием прогнозов":
+        await admin_set_forecast_mode_button(message, "auto")
+
+    # BROADCAST
+    elif text == "Отправить сообщение":
+        await admin_broadcast_start(message, state)
+
     else:
         await message.answer("Команда не распознана")
 
@@ -833,9 +889,9 @@ async def handle_my_profile(message: Message) -> None:
             message.from_user.id,
         )
 
-    name = html_escape(str(user["name"]))
-    team = html_escape(str(user["team"] or "не указана"))
-    nick = html_escape(str(user["nickname"] or "ник скрыт"))
+    name = html_escape(user["name"])
+    team = html_escape(user["team"] or "не указана")
+    nick = html_escape(user["nickname"] or "ник скрыт")
     points = int(user["points"] or 0)
 
     response = (
@@ -855,8 +911,8 @@ async def handle_my_profile(message: Message) -> None:
 
 
 async def handle_make_forecast(message: Message, state: FSMContext) -> None:
-    if not is_forecast_open():
-        await message.answer("Прием прогнозов остановлен. Дождитесь вторника 18:00.")
+    if not await is_forecast_open_effective():
+        await message.answer("Прием прогнозов остановлен.")
         return
 
     iso_year, week = current_isoyear_week()
@@ -921,7 +977,7 @@ async def send_next_match(message: Message, state: FSMContext) -> None:
 
 @router.message(ForecastStates.waiting_for_score)
 async def process_forecast_score(message: Message, state: FSMContext) -> None:
-    if not is_forecast_open():
+    if not await is_forecast_open_effective():
         await message.answer("Время для внесения прогнозов истекло. Прогноз не сохранён.")
         await state.clear()
         await send_main_menu(message)
@@ -1005,8 +1061,8 @@ async def handle_leaderboard(message: Message) -> None:
 
     if user_row:
         response += (
-            f"\n<b>Ваш результат:</b> {int(user_row['rank'])}. - {html_escape(str(user_row['name']))} - "
-            f"{html_escape(str(user_row['team'] or '—'))} - {int(user_row['points'] or 0)} очков"
+            f"\n<b>Ваш результат:</b> {int(user_row['rank'])}. - {html_escape(user_row['name'])} - "
+            f"{html_escape(user_row['team'] or '—')} - {int(user_row['points'] or 0)} очков"
         )
 
     await message.answer(response)
@@ -1038,21 +1094,14 @@ async def handle_month_leaderboard(message: Message) -> None:
 
     if user_row:
         response += (
-            f"\n<b>Ваш результат:</b> {int(user_row['rank'])}. {html_escape(str(user_row['name']))} - "
-            f"{html_escape(str(user_row['team'] or '—'))} - {int(user_row['points'] or 0)} очков"
+            f"\n<b>Ваш результат:</b> {int(user_row['rank'])}. {html_escape(user_row['name'])} - "
+            f"{html_escape(user_row['team'] or '—')} - {int(user_row['points'] or 0)} очков"
         )
 
     await message.answer(response)
 
 
 async def handle_team_leaderboard(message: Message) -> None:
-    """
-    Топ команд по сумме users.points, кроме "Болельщик".
-    Внизу:
-      <i>Ваша команда:</i>
-      - если болельщик: "Болельщики не учитываются при подсчете очков команд."
-      - иначе: "4. Анвизор - 52 очков."
-    """
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT team FROM users WHERE telegram_id=$1", message.from_user.id)
         if not user:
@@ -1116,9 +1165,6 @@ async def handle_team_leaderboard(message: Message) -> None:
 
 
 async def handle_view_points(message: Message) -> None:
-    """
-    Показывает очки по последнему набору матчей, по которому уже начислялись очки.
-    """
     async with db_pool.acquire() as conn:
         applied_set = await get_latest_applied_set(conn)
         if not applied_set:
@@ -1367,6 +1413,7 @@ async def process_delete_tables_confirmation(message: Message, state: FSMContext
             await conn.execute("DROP TABLE IF EXISTS users CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS monthleaders CASCADE;")
             await conn.execute("DROP TABLE IF EXISTS blacklist CASCADE;")
+            await conn.execute("DROP TABLE IF EXISTS forecast_control CASCADE;")
 
             legacy = await conn.fetch(
                 """
@@ -1444,7 +1491,6 @@ async def admin_ban_receive_id(message: Message, state: FSMContext) -> None:
         return
 
     tid = int(raw)
-
     if tid in ADMIN_IDS:
         await message.answer("Администратора забанить нельзя")
         await state.clear()
@@ -1471,10 +1517,8 @@ async def admin_ban_receive_id(message: Message, state: FSMContext) -> None:
         )
         rank = int(rank_row["rank"]) if rank_row else 0
 
-    await state.update_data(ban_tid=tid, ban_rank=rank)
-    await message.answer(
-        f"Забанить пользователя ({rank} место, {user['nickname']}, {tid}) (Да/Нет)"
-    )
+    await state.update_data(ban_tid=tid)
+    await message.answer(f"Забанить пользователя ({rank} место, {user['nickname']}, {tid}) (Да/Нет)")
     await state.set_state(BanStates.waiting_for_confirmation)
 
 
@@ -1485,8 +1529,7 @@ async def admin_ban_confirm(message: Message, state: FSMContext) -> None:
         return
 
     ans = (message.text or "").strip().lower()
-    data = await state.get_data()
-    tid = int(data.get("ban_tid", 0))
+    tid = int((await state.get_data()).get("ban_tid", 0))
 
     if ans == "нет":
         await message.answer("Отменено")
@@ -1549,7 +1592,7 @@ async def admin_blacklist_show(message: Message) -> None:
 
     lines = []
     for r in rows:
-        nick = html_escape(str(r["nickname"] or "ник скрыт"))
+        nick = html_escape(r["nickname"] or "ник скрыт")
         lines.append(f"{nick}, {r['telegram_id']}, {int(r['points'] or 0)} очков.")
     await message.answer("\n".join(lines))
 
@@ -1571,7 +1614,6 @@ async def admin_unban_receive_id(message: Message, state: FSMContext) -> None:
         return
 
     tid = int(raw)
-
     if tid in ADMIN_IDS:
         await message.answer("Администратора забанить нельзя, разблокировка не требуется.")
         await state.clear()
@@ -1655,8 +1697,7 @@ async def admin_unban_receive_team(message: Message, state: FSMContext) -> None:
     name = str(data["unban_name"])
     points = int(data["unban_points"])
 
-    # nickname берём из Telegram по факту: если у пользователя скрыт username — будет "ник скрыт"
-    # (мы здесь не можем взять message.from_user.username, потому что сообщение пишет админ)
+    # Никнейм берём из Telegram по chat.username (если недоступно/скрыто — "ник скрыт")
     nickname = "ник скрыт"
     try:
         chat = await message.bot.get_chat(tid)
@@ -1709,10 +1750,96 @@ async def admin_unban_receive_team(message: Message, state: FSMContext) -> None:
     await send_main_menu(message)
 
 
+# ==================== ADMIN: FORECAST CONTROL ====================
+async def admin_set_forecast_mode_button(message: Message, mode: str) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    async with db_pool.acquire() as conn:
+        await set_forecast_mode(conn, mode, message.from_user.id)
+        current = await get_forecast_mode(conn)
+
+    if current == "open":
+        await message.answer("✅ Прием прогнозов ОТКРЫТ вручную (игнорируя расписание).")
+    elif current == "closed":
+        await message.answer("⛔ Прием прогнозов ЗАКРЫТ вручную (игнорируя расписание).")
+    else:
+        await message.answer("🕒 Прием прогнозов переведен в АВТО режим (по расписанию).")
+
+    await send_main_menu(message)
+
+
+# ==================== ADMIN: BROADCAST ====================
+async def admin_broadcast_start(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        return
+    await message.answer("Введите сообщение для рассылки всем пользователям:")
+    await state.set_state(BroadcastStates.waiting_for_text)
+
+
+@router.message(BroadcastStates.waiting_for_text)
+async def admin_broadcast_receive_text(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Сообщение не может быть пустым. Введите текст:")
+        return
+
+    await state.update_data(broadcast_text=text)
+    await message.answer("Отправить сообщение? (Да/Нет)")
+    await state.set_state(BroadcastStates.waiting_for_confirmation)
+
+
+@router.message(BroadcastStates.waiting_for_confirmation)
+async def admin_broadcast_confirm(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    ans = (message.text or "").strip().lower()
+    data = await state.get_data()
+    text = str(data.get("broadcast_text") or "")
+
+    if ans == "нет":
+        await message.answer("Отменено.")
+        await state.clear()
+        await send_main_menu(message)
+        return
+
+    if ans != "да":
+        await message.answer("Ответьте Да или Нет")
+        return
+
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT telegram_id FROM users")
+
+    sent = 0
+    for u in users:
+        uid = int(u["telegram_id"])
+        try:
+            # пробуем отправить как есть (с дефолтным parse_mode HTML)
+            await message.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            try:
+                # если сломалась разметка HTML — отправим безопасно, экранировав
+                await message.bot.send_message(uid, html_escape(text))
+                sent += 1
+            except Exception as e:
+                logging.error("Ошибка рассылки пользователю %s: %s", uid, e)
+
+    await message.answer(f"Сообщение отправлено. Получателей: {sent}")
+    await state.clear()
+    await send_main_menu(message)
+
+
 # ==================== MAIN ====================
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
-
     await init_db()
 
     bot = Bot(
