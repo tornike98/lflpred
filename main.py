@@ -45,7 +45,7 @@ DEFAULT_TEAMS = [
     "Русский Стандарт", "Сбербанк", "Северо-Запад", "СКЛФ", "Смартавиа", "Такси Ритм", "Фора",
     "Хаджиме", "Царицыно", "Боавишта", "Вейрус", "Геофак", "Годзилла Крю", "Горки парк", "Грут",
     "Нагатино", "Нефть", "Нижний Новгород", "Орехово", "Спарта Москва", "СТИЛ", "Фарвартер",
-    "Форвард", "БРВ", "Вежливые люди", "Джей-Уан-Д", "Квантум", "Кони-Д", "Олимпик", "Орион",
+    "Форвард", "БРВ", "Вежливые люди", "Джей-Уан-2", "Квантум", "Кони-Д", "Олимпик", "Орион",
     "Рестарт", "Рубеж", "Стандард", "Туристы", "Фиора", "Фортуна", "Эдельвейс", "Восточное Бутово-Д",
     "Греймстаун", "Дерби", "Квантум-Д", "Кони-Д", "Корсары-Д", "Маяк-Д", "Молоково-Д", "Рубеж-Д",
     "Русский Стандард-Д", "Спарта Москва-Д", "Фора-2",
@@ -193,6 +193,7 @@ ADMIN_BUTTONS = [
     "Таблица АДМИН",
     "Месяц АДМИН",
     "Посмотреть очки команды",
+    "Посмотреть прогноз пользователя",
     "Добавить или удалить команду",
     "Забанить пользователя",
     "Разблокировать пользователя",
@@ -255,6 +256,10 @@ class TeamPointsStates(StatesGroup):
 class TeamManageStates(StatesGroup):
     waiting_for_action = State()  # Добавить / Удалить
     waiting_for_team_name = State()
+
+
+class UserForecastStates(StatesGroup):
+    waiting_for_name = State()
 
 
 # ==================== TIME HELPERS ====================
@@ -420,7 +425,7 @@ async def init_db() -> None:
 
         # Matches/forecasts
         await _maybe_rename_legacy(conn, "matches", {"iso_year", "week", "match_index", "match_name"})
-        await _maybe_rename_legacy(conn, "forecasts", {"iso_year", "week", "match_index", "telegram_id", "forecast"})
+        await _maybe_rename_legacy(conn, "forecasts", {"id", "iso_year", "week", "match_index", "telegram_id", "forecast"})
 
         await conn.execute(
             """
@@ -1002,8 +1007,7 @@ async def process_name(message: Message, state: FSMContext) -> None:
     await state.update_data(reg_name=name)
     await message.answer(
         "Укажите название вашей команды.\n"
-        "Если вы хотите поддержать свою команду, регистрируйтесь с ее названием.\n"
-        f"Если хотите поучаствовать зачете болельщиков, укажите «{FAN_TEAM}»."
+        f"Если вы не являетесь членом команды, укажите «{FAN_TEAM}»."
     )
     await state.set_state(RegisterStates.waiting_for_team)
 
@@ -1050,11 +1054,7 @@ async def process_team(message: Message, state: FSMContext) -> None:
         "5. Таблица лидеров обновляется после внесения результатов администратором.\n"
         "6. В случае нарушения правил или использования неподобающих никнеймов, пользователь попадает в бан.\n"
         "7. В случае указывания команды, за которую не заявлен пользователь - штраф 10 очков.\n"
-        "8. Если матч не состоялся или одной из команд присвоен статус 'Техническое поражение', пользователи не получают очки.\n\n"
-        "Всего в нашем конкурсе прогнозов будет три зачета:.\n"
-        "- Индивидуальный, где каждый набирает очки для себя \n"
-        "- Командный, в котором в зачет будут идти все очки от представителей одного клуба \n"
-        "- Зачет болельщиков, для тех, кто не состоит в команде, но любит посмотреть Южную Лигу ЛФЛ \n"
+        "8. Если матч не состоялся или одной из команд присвоен статус 'Техническое поражение', пользователи не получают очки.\n"
         "Удачи!"
     )
     await message.answer(rules_text)
@@ -1094,6 +1094,8 @@ async def main_menu_handler(message: Message, state: FSMContext) -> None:
     # ADMIN
     elif text == "Посмотреть очки команды":
         await admin_team_points_start(message, state)
+    elif text == "Посмотреть прогноз пользователя":
+        await admin_user_forecast_start(message, state)
     elif text == "Добавить или удалить команду":
         await admin_manage_team_start(message, state)
     elif text == "Внести результаты":
@@ -1665,6 +1667,96 @@ async def admin_team_points_show(message: Message, state: FSMContext) -> None:
     await send_text_in_chunks(message, header + "\n".join(lines))
     await log_admin_action(message.from_user.id, "team_points", f"team={team}, count={len(rows)}")
 
+    await state.clear()
+    await send_main_menu(message)
+
+
+# ==================== ADMIN: VIEW USER FORECAST ====================
+async def admin_user_forecast_start(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    await message.answer("Введите имя этого пользователя")
+    await state.set_state(UserForecastStates.waiting_for_name)
+
+
+@router.message(UserForecastStates.waiting_for_name)
+async def admin_user_forecast_show(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("Имя не может быть пустым. Введите имя этого пользователя")
+        return
+
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT telegram_id, name
+            FROM users
+            WHERE LOWER(name) = LOWER($1)
+            LIMIT 1
+            """,
+            name,
+        )
+
+        if not user:
+            await message.answer("Этот пользователь еще не делал прогноз")
+            await state.clear()
+            await send_main_menu(message)
+            return
+
+        latest_forecast_row = await conn.fetchrow(
+            """
+            SELECT id, iso_year, week
+            FROM forecasts
+            WHERE telegram_id = $1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            int(user["telegram_id"]),
+        )
+
+        if not latest_forecast_row:
+            await message.answer("Этот пользователь еще не делал прогноз")
+            await state.clear()
+            await send_main_menu(message)
+            return
+
+        iso_year = int(latest_forecast_row["iso_year"])
+        week = int(latest_forecast_row["week"])
+
+        rows = await conn.fetch(
+            """
+            SELECT m.match_name, f.forecast
+            FROM forecasts f
+            JOIN matches m
+              ON m.iso_year = f.iso_year
+             AND m.week = f.week
+             AND m.match_index = f.match_index
+            WHERE f.telegram_id = $1
+              AND f.iso_year = $2
+              AND f.week = $3
+            ORDER BY f.match_index
+            """,
+            int(user["telegram_id"]),
+            iso_year,
+            week,
+        )
+
+    if not rows:
+        await message.answer("Этот пользователь еще не делал прогноз")
+        await state.clear()
+        await send_main_menu(message)
+        return
+
+    response = f"Последний прогноз пользователя {html_escape(str(user['name']))}:\n"
+    response += "\n".join(f"{r['match_name']} {r['forecast']}" for r in rows)
+
+    await message.answer(response)
     await state.clear()
     await send_main_menu(message)
 
