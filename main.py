@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -188,6 +188,7 @@ ADMIN_BUTTONS = [
     "Внести результаты",
     "Изменить результаты",
     "Внести новые матчи",
+    "Изменить матчи",
     "Опубликовать результаты",
     "Удалить все таблицы",
     "Таблица АДМИН",
@@ -222,6 +223,11 @@ class ForecastStates(StatesGroup):
 
 class NewMatchesStates(StatesGroup):
     waiting_for_match = State()
+
+
+class EditMatchesStates(StatesGroup):
+    waiting_for_match_number = State()
+    waiting_for_match_name = State()
 
 
 class EnterResultsStates(StatesGroup):
@@ -307,6 +313,15 @@ def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
 
 async def send_main_menu(message: Message) -> None:
     await message.answer("Выберите действие:", reply_markup=build_main_menu(message.from_user.id))
+
+
+def is_cancel_text(text: Optional[str]) -> bool:
+    t = (text or "").strip()
+    return t in {"/cancel", "Отмена", "Назад"}
+
+
+def is_menu_button_text(text: Optional[str]) -> bool:
+    return (text or "").strip() in ALL_BUTTONS
 
 
 async def send_text_in_chunks(message: Message, text: str, chunk_limit: int = 3500) -> None:
@@ -700,6 +715,23 @@ class RegistrationCheckMiddleware(BaseMiddleware):
             await event.answer("База данных ещё не инициализирована, попробуйте позже.")
             return
 
+        # /start и /cancel должны проходить в любом состоянии.
+        state: Optional[FSMContext] = data.get("state")
+        current_state = await state.get_state() if state else None
+        text = (event.text or "").strip()
+
+        # Если пользователь находится внутри действия, кнопки меню не должны записываться как данные.
+        # Например, «Мой профиль» больше не сможет сохраниться как название матча.
+        if (
+            current_state
+            and not current_state.startswith("RegisterStates")
+            and not text.startswith("/start")
+            and not is_cancel_text(text)
+            and is_menu_button_text(text)
+        ):
+            await event.answer("Сейчас включено другое действие. Чтобы выйти без сохранения, напишите /cancel или нажмите Отмена.")
+            return
+
         # Admin bypass blacklist & registration requirement, but keep nickname sync if exists in users.
         if event.from_user and event.from_user.id in ADMIN_IDS:
             async with db_pool.acquire() as conn:
@@ -970,9 +1002,22 @@ async def rollback_points_for_week(conn: asyncpg.Connection, iso_year: int, week
     await conn.execute("DELETE FROM weekleaders")
 
 
+# ==================== CANCEL ACTION ====================
+@router.message(Command("cancel"))
+@router.message(F.text.in_(["Отмена", "Назад"]))
+async def cancel_action(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Действие отменено. Ничего не сохранено.",
+        reply_markup=build_main_menu(message.from_user.id),
+    )
+
+
 # ==================== START / REGISTRATION ====================
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+
     async with db_pool.acquire() as conn:
         user = await conn.fetchval("SELECT 1 FROM users WHERE telegram_id=$1", message.from_user.id)
 
@@ -1104,6 +1149,8 @@ async def main_menu_handler(message: Message, state: FSMContext) -> None:
         await admin_edit_results(message, state)
     elif text == "Внести новые матчи":
         await admin_new_matches(message, state)
+    elif text == "Изменить матчи":
+        await admin_edit_matches_start(message, state)
     elif text == "Опубликовать результаты":
         await admin_publish_results(message)
     elif text == "Удалить все таблицы":
@@ -1877,6 +1924,9 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
         return
 
     match_name = (message.text or "").strip()
+    if is_menu_button_text(match_name):
+        await message.answer("Это кнопка меню, а не название матча. Чтобы выйти без сохранения, напишите /cancel.")
+        return
     if not match_name:
         await message.answer("Название матча не может быть пустым, введите ещё раз:")
         return
@@ -1918,6 +1968,140 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
     await broadcast_new_matches(message.bot, iso_year, week)
     await log_admin_action(message.from_user.id, "new_matches", f"set={iso_year}-W{week}")
 
+    await send_main_menu(message)
+
+
+async def admin_edit_matches_start(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+
+    async with db_pool.acquire() as conn:
+        latest = await get_latest_matches_set(conn)
+        if not latest:
+            await message.answer("Матчей еще нет")
+            return
+
+        iso_year, week = latest
+        rows = await conn.fetch(
+            """
+            SELECT match_index, match_name, result
+            FROM matches
+            WHERE iso_year=$1 AND week=$2
+            ORDER BY match_index
+            """,
+            iso_year,
+            week,
+        )
+
+    matches_text = "\n".join(
+        f"{int(r['match_index'])}. {html_escape(str(r['match_name']))}"
+        + (f" — результат: {html_escape(str(r['result']))}" if r["result"] else "")
+        for r in rows
+    )
+
+    await state.update_data(edit_match_iso_year=iso_year, edit_match_week=week)
+    await state.set_state(EditMatchesStates.waiting_for_match_number)
+
+    await message.answer(
+        f"Текущие матчи:\n{matches_text}\n\n"
+        "Введите номер матча, который нужно изменить: от 1 до 10.\n"
+        "Для отмены напишите /cancel."
+    )
+
+
+@router.message(EditMatchesStates.waiting_for_match_number)
+async def admin_edit_matches_number(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+    if is_menu_button_text(text):
+        await message.answer("Это кнопка меню. Чтобы выйти без сохранения, напишите /cancel.")
+        return
+    if not text.isdigit():
+        await message.answer("Введите только номер матча: от 1 до 10.")
+        return
+
+    idx = int(text)
+    if idx < 1 or idx > 10:
+        await message.answer("Номер матча должен быть от 1 до 10.")
+        return
+
+    data = await state.get_data()
+    iso_year = int(data["edit_match_iso_year"])
+    week = int(data["edit_match_week"])
+
+    async with db_pool.acquire() as conn:
+        match = await conn.fetchrow(
+            """
+            SELECT match_name
+            FROM matches
+            WHERE iso_year=$1 AND week=$2 AND match_index=$3
+            """,
+            iso_year,
+            week,
+            idx,
+        )
+
+    if not match:
+        await message.answer("Матч с таким номером не найден. Введите другой номер.")
+        return
+
+    await state.update_data(edit_match_index=idx, edit_match_old_name=str(match["match_name"]))
+    await state.set_state(EditMatchesStates.waiting_for_match_name)
+    await message.answer(
+        f"Матч {idx}: {html_escape(str(match['match_name']))}\n"
+        "Введите новое название матча:"
+    )
+
+
+@router.message(EditMatchesStates.waiting_for_match_name)
+async def admin_edit_matches_name(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        return
+
+    new_name = (message.text or "").strip()
+    if is_menu_button_text(new_name):
+        await message.answer("Это кнопка меню, а не название матча. Чтобы выйти без сохранения, напишите /cancel.")
+        return
+    if not new_name:
+        await message.answer("Название матча не может быть пустым. Введите новое название:")
+        return
+
+    data = await state.get_data()
+    iso_year = int(data["edit_match_iso_year"])
+    week = int(data["edit_match_week"])
+    idx = int(data["edit_match_index"])
+    old_name = str(data.get("edit_match_old_name") or "")
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE matches
+            SET match_name=$1
+            WHERE iso_year=$2 AND week=$3 AND match_index=$4
+            """,
+            new_name,
+            iso_year,
+            week,
+            idx,
+        )
+
+    await log_admin_action(
+        message.from_user.id,
+        "edit_match",
+        f"set={iso_year}-W{week}, index={idx}, old={old_name}, new={new_name}",
+    )
+
+    await state.clear()
+    await message.answer(
+        f"Матч {idx} изменен:\n"
+        f"Было: {html_escape(old_name)}\n"
+        f"Стало: {html_escape(new_name)}"
+    )
     await send_main_menu(message)
 
 
@@ -2018,7 +2202,12 @@ async def process_result_entry(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
 
-    result = (message.text or "").strip().lower()
+    raw_text = (message.text or "").strip()
+    if is_menu_button_text(raw_text):
+        await message.answer("Это кнопка меню, а не результат матча. Чтобы выйти без сохранения, напишите /cancel.")
+        return
+
+    result = raw_text.lower()
     if result != "тп":
         if result.count("-") != 1:
             await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
