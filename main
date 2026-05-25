@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -346,6 +346,8 @@ async def clear_forecasts_for_week(iso_year: int, week: int) -> None:
 # -------------------- USER HANDLERS --------------------
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+
     if db_pool is None:
         await message.answer("База данных ещё не инициализирована, попробуйте позже.")
         return
@@ -406,6 +408,17 @@ async def process_name(message: Message, state: FSMContext) -> None:
     )
     await message.answer(rules_text)
     await send_main_menu(message)
+
+
+# Отмена любого незавершенного действия
+@router.message(Command("cancel"))
+@router.message(F.text.in_(["Отмена", "Назад"]))
+async def cancel_action(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Действие отменено. Ничего не сохранено.",
+        reply_markup=build_main_menu(message.from_user.id),
+    )
 
 
 # Главное меню — только когда пользователь НЕ в FSM состоянии
@@ -572,6 +585,13 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
         return
 
     score = (message.text or "").strip()
+
+    if score in ALL_BUTTONS:
+        await message.answer(
+            "Сейчас включен режим внесения прогноза. Чтобы выйти без сохранения, напишите /cancel."
+        )
+        return
+
     if score.count("-") != 1:
         await message.answer("Неверный формат. Введите счет в формате '2-1'")
         return
@@ -770,6 +790,13 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
         return
 
     match_name = (message.text or "").strip()
+
+    if match_name in ALL_BUTTONS:
+        await message.answer(
+            "Сейчас включен режим внесения матчей. Чтобы выйти без сохранения, напишите /cancel."
+        )
+        return
+
     if not match_name:
         await message.answer("Название матча не может быть пустым, введите ещё раз:")
         return
@@ -866,7 +893,15 @@ async def process_result_entry(message: Message, state: FSMContext) -> None:
         await message.answer("Недостаточно прав.")
         return
 
-    result = (message.text or "").strip().lower()
+    raw_result = (message.text or "").strip()
+
+    if raw_result in ALL_BUTTONS:
+        await message.answer(
+            "Сейчас включен режим внесения результатов. Чтобы выйти без сохранения, напишите /cancel."
+        )
+        return
+
+    result = raw_result.lower()
     if result != "тп":
         if result.count("-") != 1:
             await message.answer("Неверный формат. Введите результат в формате '3-4' или 'тп'")
