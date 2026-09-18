@@ -15,7 +15,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 
 # ==================== ENV ====================
@@ -185,6 +185,7 @@ MENU_BUTTONS = [
     "Посмотреть мои очки",
 ]
 ADMIN_BUTTONS = [
+    "Внести прогноз за пользователя",
     "Внести результаты",
     "Изменить результаты",
     "Внести новые матчи",
@@ -219,6 +220,13 @@ class ChangeTeamStates(StatesGroup):
 
 class ForecastStates(StatesGroup):
     waiting_for_score = State()
+
+
+class AdminForecastStates(StatesGroup):
+    waiting_for_user = State()
+    waiting_for_match = State()
+    waiting_for_score = State()
+    waiting_for_confirmation = State()
 
 
 class NewMatchesStates(StatesGroup):
@@ -679,12 +687,32 @@ async def set_forecast_mode(conn: asyncpg.Connection, mode: str, updated_by: int
 
 async def is_forecast_open_effective() -> bool:
     async with db_pool.acquire() as conn:
-        mode = await get_forecast_mode(conn)
+        return await forecast_open_on_connection(conn)
+
+
+async def forecast_open_on_connection(conn: asyncpg.Connection) -> bool:
+    mode = await get_forecast_mode(conn)
     if mode == "open":
         return True
     if mode == "closed":
         return False
     return is_forecast_open_schedule()
+
+
+async def lock_forecast_matches(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
+    # Serialize forecast writes with match/result updates and points application.
+    await conn.fetch(
+        "SELECT id FROM matches WHERE iso_year=$1 AND week=$2 ORDER BY match_index FOR UPDATE",
+        iso_year, week,
+    )
+
+
+async def forecast_set_locked(conn: asyncpg.Connection, iso_year: int, week: int) -> bool:
+    return bool(await conn.fetchval(
+        """SELECT EXISTS (SELECT 1 FROM points_applied WHERE iso_year=$1 AND week=$2)
+        OR EXISTS (SELECT 1 FROM matches WHERE iso_year=$1 AND week=$2 AND result IS NOT NULL)""",
+        iso_year, week,
+    ))
 
 
 # ==================== SAFE SEND / RATE LIMIT ====================
@@ -859,6 +887,7 @@ async def clear_forecasts_for_week(iso_year: int, week: int) -> None:
 
 
 async def apply_points_for_week(conn: asyncpg.Connection, iso_year: int, week: int) -> None:
+    await lock_forecast_matches(conn, iso_year, week)
     if await is_applied(conn, iso_year, week):
         return
 
@@ -1006,9 +1035,11 @@ async def rollback_points_for_week(conn: asyncpg.Connection, iso_year: int, week
 @router.message(Command("cancel"))
 @router.message(F.text.in_(["Отмена", "Назад"]))
 async def cancel_action(message: Message, state: FSMContext) -> None:
+    forecasting = await state.get_state() == ForecastStates.waiting_for_score.state
     await state.clear()
     await message.answer(
-        "Действие отменено. Ничего не сохранено.",
+        ("Ввод остановлен. Внесённые прогнозы сохранены. Продолжить можно кнопкой «Сделать прогноз» в часы приёма."
+         if forecasting else "Действие отменено. Неподтверждённые изменения не сохранены."),
         reply_markup=build_main_menu(message.from_user.id),
     )
 
@@ -1137,6 +1168,8 @@ async def main_menu_handler(message: Message, state: FSMContext) -> None:
         await handle_view_points(message)
 
     # ADMIN
+    elif text == "Внести прогноз за пользователя":
+        await admin_forecast_start(message, state)
     elif text == "Посмотреть очки команды":
         await admin_team_points_start(message, state)
     elif text == "Посмотреть прогноз пользователя":
@@ -1265,19 +1298,8 @@ async def handle_make_forecast(message: Message, state: FSMContext) -> None:
             await message.answer(msg)
             return
 
-        existing = await conn.fetchval(
-            """
-            SELECT 1
-            FROM forecasts
-            WHERE telegram_id=$1 AND iso_year=$2 AND week=$3
-            LIMIT 1
-            """,
-            message.from_user.id,
-            iso_year,
-            week,
-        )
-        if existing:
-            await message.answer("Прогноз на эту неделю уже сделан, дождитесь следующей недели")
+        if await forecast_set_locked(conn, iso_year, week):
+            await message.answer("Внесение результатов уже началось. Дополнение прогнозов закрыто.")
             return
 
     await state.update_data(forecast_iso_year=iso_year, forecast_week=week, current_match_index=1)
@@ -1293,22 +1315,31 @@ async def send_next_match(message: Message, state: FSMContext) -> None:
     async with db_pool.acquire() as conn:
         match = await conn.fetchrow(
             """
-            SELECT match_name
-            FROM matches
-            WHERE iso_year=$1 AND week=$2 AND match_index=$3
+            SELECT m.match_index, m.match_name
+            FROM matches m
+            WHERE m.iso_year=$1 AND m.week=$2
+              AND NOT EXISTS (
+                  SELECT 1 FROM forecasts f
+                  WHERE f.iso_year=m.iso_year AND f.week=m.week
+                    AND f.match_index=m.match_index AND f.telegram_id=$3
+              )
+            ORDER BY m.match_index
+            LIMIT 1
             """,
             iso_year,
             week,
-            current_match_index,
+            message.from_user.id,
         )
 
     if match:
+        current_match_index = int(match["match_index"])
+        await state.update_data(current_match_index=current_match_index, forecast_match_name=str(match["match_name"]))
         await state.set_state(ForecastStates.waiting_for_score)
         await message.answer(
             f"Прогноз для матча {current_match_index}: {match['match_name']}\nВведите счет в формате '2-1'"
         )
     else:
-        await message.answer("Прогноз принят, желаем удачи!")
+        await message.answer("Все 10 прогнозов сохранены. Изменить их самостоятельно нельзя. Желаем удачи!")
         await state.clear()
         await send_main_menu(message)
 
@@ -1316,7 +1347,7 @@ async def send_next_match(message: Message, state: FSMContext) -> None:
 @router.message(ForecastStates.waiting_for_score)
 async def process_forecast_score(message: Message, state: FSMContext) -> None:
     if not await is_forecast_open_effective():
-        await message.answer("Время для внесения прогнозов истекло. Прогноз не сохранён.")
+        await message.answer("Приём прогнозов закрыт. Этот счёт не сохранён. Ранее внесённые прогнозы сохранены.")
         await state.clear()
         await send_main_menu(message)
         return
@@ -1337,17 +1368,32 @@ async def process_forecast_score(message: Message, state: FSMContext) -> None:
 
     async with db_pool.acquire() as conn:
         try:
-            await conn.execute(
-                """
-                INSERT INTO forecasts (telegram_id, iso_year, week, match_index, forecast)
-                VALUES ($1, $2, $3, $4, $5)
-                """,
-                message.from_user.id,
-                iso_year,
-                week,
-                current_match_index,
-                score,
-            )
+            async with conn.transaction():
+                await lock_forecast_matches(conn, iso_year, week)
+                if (iso_year, week) != current_isoyear_week() or not await forecast_open_on_connection(conn):
+                    await state.clear()
+                    await message.answer("Приём прогнозов закрыт. Ранее внесённые прогнозы сохранены.")
+                    return
+                if await forecast_set_locked(conn, iso_year, week):
+                    await state.clear()
+                    await message.answer("Внесение результатов уже началось. Дополнение прогнозов закрыто.")
+                    return
+                match_name = await conn.fetchval(
+                    "SELECT match_name FROM matches WHERE iso_year=$1 AND week=$2 AND match_index=$3",
+                    iso_year, week, current_match_index,
+                )
+                if match_name is None or match_name != data.get("forecast_match_name"):
+                    await message.answer("Матч изменён. Этот счёт не сохранён. Проверьте пару команд и введите прогноз заново.")
+                else:
+                    saved = await conn.fetchval(
+                        """INSERT INTO forecasts (telegram_id, iso_year, week, match_index, forecast)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (telegram_id, iso_year, week, match_index) DO NOTHING
+                        RETURNING id""",
+                        message.from_user.id, iso_year, week, current_match_index, score,
+                    )
+                    if saved is None:
+                        await message.answer("На этот матч прогноз уже сохранён. Изменять его может только администратор.")
         except Exception as e:
             logging.error("insert forecast failed: %s", e)
             await message.answer("Не удалось сохранить прогноз (возможно, он уже был внесен).")
@@ -2313,6 +2359,178 @@ async def process_delete_tables_confirmation(message: Message, state: FSMContext
     await state.clear()
 
 
+# ==================== ADMIN: FORECAST ENTRY ====================
+async def admin_forecast_start(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await message.answer("Недостаточно прав.")
+        return
+    await state.set_state(AdminForecastStates.waiting_for_user)
+    await message.answer("Введите Telegram ID зарегистрированного пользователя. Для выхода — /cancel.")
+
+
+async def admin_forecast_show_matches(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    year, week, tid = data["af_year"], data["af_week"], data["af_tid"]
+    async with db_pool.acquire() as conn:
+        if await forecast_set_locked(conn, year, week):
+            await state.clear()
+            await message.answer("Внесение результатов уже началось. Изменение прогнозов закрыто.")
+            return
+        rows = await conn.fetch(
+            """SELECT m.match_index, m.match_name, f.forecast FROM matches m
+            LEFT JOIN forecasts f ON f.iso_year=m.iso_year AND f.week=m.week
+                AND f.match_index=m.match_index AND f.telegram_id=$3
+            WHERE m.iso_year=$1 AND m.week=$2 ORDER BY m.match_index""",
+            year, week, tid,
+        )
+    text = f"Прогнозы: {html_escape(data['af_name'])}, ID {tid}\nГод {year}, неделя {week}\n\n"
+    text += "\n".join(
+        f"{r['match_index']}. {html_escape(r['match_name'])}: {html_escape(r['forecast'] or 'не внесён')}"
+        for r in rows
+    )
+    await state.set_state(AdminForecastStates.waiting_for_match)
+    await message.answer(text + "\n\nВведите номер матча (1–10), чтобы добавить или изменить счёт. Для выхода — /cancel. Подтверждённые счёты сохраняются.")
+
+
+@router.message(AdminForecastStates.waiting_for_user)
+async def admin_forecast_user(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        await message.answer("Недостаточно прав.")
+        return
+    raw = (message.text or "").strip()
+    if not raw.isascii() or not raw.isdigit() or not 0 < int(raw) < 2**63:
+        await message.answer("Введите корректный числовой Telegram ID.")
+        return
+    tid = int(raw)
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT name FROM users WHERE telegram_id=$1", tid)
+        if not user:
+            await message.answer("Пользователь с таким ID не зарегистрирован. Проверьте ID.")
+            return
+        latest = await get_latest_matches_set(conn)
+        if not latest:
+            await message.answer("Матчи ещё не внесены.")
+            return
+        year, week = latest
+        ok, reason = await validate_match_set_1_to_10(conn, year, week)
+        if not ok:
+            await message.answer(reason)
+            return
+    await state.update_data(af_tid=tid, af_name=str(user["name"]), af_year=year, af_week=week)
+    await admin_forecast_show_matches(message, state)
+
+
+@router.message(AdminForecastStates.waiting_for_match)
+async def admin_forecast_match(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        await message.answer("Недостаточно прав.")
+        return
+    raw = (message.text or "").strip()
+    if not raw.isascii() or not raw.isdigit() or not 1 <= int(raw) <= 10:
+        await message.answer("Введите номер матча от 1 до 10.")
+        return
+    data = await state.get_data()
+    idx = int(raw)
+    async with db_pool.acquire() as conn:
+        name = await conn.fetchval(
+            "SELECT match_name FROM matches WHERE iso_year=$1 AND week=$2 AND match_index=$3",
+            data["af_year"], data["af_week"], idx,
+        )
+        old = await conn.fetchval(
+            "SELECT forecast FROM forecasts WHERE telegram_id=$1 AND iso_year=$2 AND week=$3 AND match_index=$4",
+            data["af_tid"], data["af_year"], data["af_week"], idx,
+        )
+    if name is None:
+        await message.answer("Матч не найден. Начните ввод заново через /cancel.")
+        return
+    await state.update_data(af_index=idx, af_match_name=name, af_old=old)
+    await state.set_state(AdminForecastStates.waiting_for_score)
+    await message.answer(
+        f"Матч {idx}: {html_escape(name)}\nСохранено: {html_escape(old or 'не внесён')}\nВведите новый счёт в формате 2-1."
+    )
+
+
+@router.message(AdminForecastStates.waiting_for_score)
+async def admin_forecast_score(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        await message.answer("Недостаточно прав.")
+        return
+    score = (message.text or "").strip()
+    if not re.fullmatch(r"[0-9]+-[0-9]+", score):
+        await message.answer("Введите счёт в формате 2-1.")
+        return
+    data = await state.get_data()
+    await state.update_data(af_score=score)
+    await state.set_state(AdminForecastStates.waiting_for_confirmation)
+    await message.answer(
+        f"Пользователь: {html_escape(data['af_name'])}, ID {data['af_tid']}\n"
+        f"Год {data['af_year']}, неделя {data['af_week']}\n"
+        f"Матч {data['af_index']}: {html_escape(data['af_match_name'])}\n"
+        f"Было: {html_escape(data['af_old'] or 'не внесён')}\nСтало: {score}\nСохранить? Да/Нет"
+    )
+
+
+@router.message(AdminForecastStates.waiting_for_confirmation)
+async def admin_forecast_confirm(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message):
+        await state.clear()
+        await message.answer("Недостаточно прав.")
+        return
+    answer = (message.text or "").strip().lower()
+    if answer == "нет":
+        await message.answer("Этот счёт не сохранён.")
+        await admin_forecast_show_matches(message, state)
+        return
+    if answer != "да":
+        await message.answer("Ответьте Да или Нет.")
+        return
+    data = await state.get_data()
+    year, week, tid, idx = data["af_year"], data["af_week"], data["af_tid"], data["af_index"]
+    error = None
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await lock_forecast_matches(conn, year, week)
+            if await get_latest_matches_set(conn) != (year, week):
+                error = "Список матчей сменился. Начните ввод заново."
+            elif await forecast_set_locked(conn, year, week):
+                error = "Внесение результатов уже началось. Прогноз не изменён."
+            elif not await conn.fetchval("SELECT 1 FROM users WHERE telegram_id=$1 FOR UPDATE", tid):
+                error = "Пользователь больше не зарегистрирован."
+            else:
+                name = await conn.fetchval(
+                    "SELECT match_name FROM matches WHERE iso_year=$1 AND week=$2 AND match_index=$3",
+                    year, week, idx,
+                )
+                old = await conn.fetchval(
+                    "SELECT forecast FROM forecasts WHERE telegram_id=$1 AND iso_year=$2 AND week=$3 AND match_index=$4",
+                    tid, year, week, idx,
+                )
+                if name is None or name != data["af_match_name"] or old != data["af_old"]:
+                    error = "Матч или прогноз изменился во время ввода. Проверьте данные заново."
+                else:
+                    await conn.execute(
+                        """INSERT INTO forecasts (telegram_id, iso_year, week, match_index, forecast)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (telegram_id, iso_year, week, match_index)
+                        DO UPDATE SET forecast=EXCLUDED.forecast""",
+                        tid, year, week, idx, data["af_score"],
+                    )
+                    await conn.execute(
+                        "INSERT INTO admin_actions (admin_id, action, details) VALUES ($1, $2, $3)",
+                        message.from_user.id, "edit_user_forecast",
+                        f"tid={tid}, set={year}-W{week}, match={idx}, old={old}, new={data['af_score']}",
+                    )
+    if error:
+        await state.clear()
+        await message.answer(error, reply_markup=build_main_menu(message.from_user.id))
+        return
+    await message.answer(f"Прогноз на матч {idx} сохранён для ID {tid}.")
+    await admin_forecast_show_matches(message, state)
+
+
 # ==================== ADMIN: TABLES ====================
 async def handle_admin_table(message: Message) -> None:
     if not _is_admin(message):
@@ -2743,7 +2961,7 @@ async def main() -> None:
         token=API_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
