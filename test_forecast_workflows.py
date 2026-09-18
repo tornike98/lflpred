@@ -133,6 +133,75 @@ class ForecastTests(unittest.IsolatedAsyncioTestCase):
         self.conn.execute.assert_not_awaited()
         self.assertIn("результатов", self.message.answer.call_args.args[0])
 
+    async def test_new_matches_rejects_full_week(self):
+        self.message.from_user.id = 99
+        self.conn.fetch.return_value = [{"match_index": i} for i in range(1, 11)]
+        await bot.admin_new_matches(self.message, self.state)
+        self.state.set_state.assert_not_awaited()
+        self.conn.execute.assert_not_awaited()
+        self.assertIn("Повторный ввод запрещён", self.message.answer.call_args.args[0])
+
+    async def test_new_matches_resumes_partial_week(self):
+        self.message.from_user.id = 99
+        self.conn.fetch.return_value = [{"match_index": i} for i in range(1, 5)]
+        with patch.object(bot, "current_isoyear_week", return_value=(2026, 38)), \
+             patch.object(bot, "forecast_set_locked", AsyncMock(return_value=False)), \
+             patch.object(bot, "get_latest_matches_set", AsyncMock(return_value=(2026, 38))):
+            await bot.admin_new_matches(self.message, self.state)
+        self.state.update_data.assert_awaited_once_with(new_match_index=5, new_match_iso_year=2026, new_match_week=38)
+        self.conn.execute.assert_not_awaited()
+
+    async def test_new_week_starts_normally(self):
+        self.message.from_user.id = 99
+        with patch.object(bot, "current_isoyear_week", return_value=(2026, 39)), \
+             patch.object(bot, "forecast_set_locked", AsyncMock(return_value=False)), \
+             patch.object(bot, "get_latest_matches_set", AsyncMock(return_value=(2026, 38))), \
+             patch.object(bot, "set_stats", AsyncMock(return_value=(10, 0))):
+            await bot.admin_new_matches(self.message, self.state)
+        self.state.update_data.assert_awaited_once_with(new_match_index=1, new_match_iso_year=2026, new_match_week=39)
+
+    async def test_new_matches_stale_session_does_not_overwrite(self):
+        self.message.from_user.id = 99
+        self.message.text = "New pair"
+        self.data.update(new_match_iso_year=2026, new_match_week=38, new_match_index=1)
+        self.conn.fetchval.return_value = None
+        with patch.object(bot, "current_isoyear_week", return_value=(2026, 38)), \
+             patch.object(bot, "forecast_set_locked", AsyncMock(return_value=False)):
+            await bot.process_new_match(self.message, self.state)
+        sql = self.conn.fetchval.call_args.args[0]
+        self.assertIn("DO NOTHING", sql)
+        self.assertNotIn("DO UPDATE", sql)
+        self.conn.execute.assert_not_awaited()
+        self.assertIn("Ничего не перезаписано", self.message.answer.call_args.args[0])
+
+    async def test_new_matches_week_rollover_stops_old_session(self):
+        self.message.from_user.id = 99
+        self.data.update(new_match_iso_year=2026, new_match_week=38, new_match_index=2)
+        with patch.object(bot, "current_isoyear_week", return_value=(2026, 39)):
+            await bot.process_new_match(self.message, self.state)
+        self.conn.fetchval.assert_not_awaited()
+        self.conn.execute.assert_not_awaited()
+        self.assertIn("новая неделя", self.message.answer.call_args.args[0])
+
+    async def test_completing_new_matches_preserves_forecasts_and_points(self):
+        self.message.from_user.id = 99
+        self.message.bot = MagicMock()
+        self.data.update(new_match_iso_year=2026, new_match_week=38, new_match_index=10)
+        self.conn.fetchval.return_value = 10
+        self.conn.fetch.return_value = [{"match_index": i} for i in range(1, 11)]
+        with patch.object(bot, "current_isoyear_week", return_value=(2026, 38)), \
+             patch.object(bot, "forecast_set_locked", AsyncMock(return_value=False)), \
+             patch.object(bot, "broadcast_new_matches", AsyncMock()) as broadcast, \
+             patch.object(bot, "log_admin_action", AsyncMock()), \
+             patch.object(bot, "send_main_menu", AsyncMock()), \
+             patch.object(bot, "clear_forecasts_for_week", AsyncMock()) as clear_forecasts, \
+             patch.object(bot, "clear_applied_markers", AsyncMock()) as clear_points:
+            await bot.process_new_match(self.message, self.state)
+        clear_forecasts.assert_not_awaited()
+        clear_points.assert_not_awaited()
+        self.conn.execute.assert_awaited_once_with("DELETE FROM weekleaders")
+        broadcast.assert_awaited_once()
+
     async def test_admin_stale_confirmation_cannot_overwrite(self):
         self.message.from_user.id = 99
         self.message.text = "Да"
