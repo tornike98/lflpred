@@ -1943,24 +1943,41 @@ async def admin_manage_team_name(message: Message, state: FSMContext) -> None:
 
 
 # ==================== ADMIN: MATCHES / RESULTS ====================
+NEW_MATCHES_ALREADY_EXIST = (
+    "Матчи на эту неделю уже внесены. Повторный ввод запрещён. "
+    "Для исправления используйте «Изменить матчи»."
+)
+
+
 async def admin_new_matches(message: Message, state: FSMContext) -> None:
     if not _is_admin(message):
         await message.answer("Недостаточно прав.")
         return
 
+    iso_year, week = current_isoyear_week()
     async with db_pool.acquire() as conn:
+        current = await conn.fetch(
+            "SELECT match_index FROM matches WHERE iso_year=$1 AND week=$2 ORDER BY match_index",
+            iso_year, week,
+        )
+        existing = {int(row["match_index"]) for row in current}
+        missing_indices = [idx for idx in range(1, 11) if idx not in existing]
+        if not missing_indices or await forecast_set_locked(conn, iso_year, week):
+            await message.answer(NEW_MATCHES_ALREADY_EXIST)
+            return
         latest = await get_latest_matches_set(conn)
-        if latest:
+        if latest and latest != (iso_year, week):
             iso_year_old, week_old = latest
             total, missing = await set_stats(conn, iso_year_old, week_old)
             if total >= 10 and missing > 0:
                 await message.answer("Сначала внесите результаты по старым матчам")
                 return
 
-    iso_year, week = current_isoyear_week()
-    await state.update_data(new_match_index=1, new_match_iso_year=iso_year, new_match_week=week)
+    idx = missing_indices[0]
+    await state.update_data(new_match_index=idx, new_match_iso_year=iso_year, new_match_week=week)
     await state.set_state(NewMatchesStates.waiting_for_match)
-    await message.answer("Введите название матча 1 из 10:")
+    prefix = "Продолжаем незавершённый список. Ранее внесённые матчи сохранены.\n" if existing else ""
+    await message.answer(f"{prefix}Введите название матча {idx} из 10:")
 
 
 @router.message(NewMatchesStates.waiting_for_match)
@@ -1982,22 +1999,43 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
     iso_year = int(data["new_match_iso_year"])
     week = int(data["new_match_week"])
 
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO matches (iso_year, week, match_index, match_name, result)
-            VALUES ($1, $2, $3, $4, NULL)
-            ON CONFLICT (iso_year, week, match_index)
-            DO UPDATE SET match_name=EXCLUDED.match_name, result=NULL
-            """,
-            iso_year,
-            week,
-            idx,
-            match_name,
-        )
+    if (iso_year, week) != current_isoyear_week():
+        await state.clear()
+        await message.answer("Наступила новая неделя. Начните внесение матчей заново. Старые матчи сохранены.")
+        return
 
-    if idx < 10:
-        idx += 1
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            if await forecast_set_locked(conn, iso_year, week):
+                await state.clear()
+                await message.answer(NEW_MATCHES_ALREADY_EXIST)
+                return
+            # The unique key also protects against another administrator's stale session.
+            inserted = await conn.fetchval(
+                """INSERT INTO matches (iso_year, week, match_index, match_name, result)
+                VALUES ($1, $2, $3, $4, NULL)
+                ON CONFLICT (iso_year, week, match_index) DO NOTHING
+                RETURNING id""",
+                iso_year, week, idx, match_name,
+            )
+            if inserted is None:
+                await state.clear()
+                await message.answer(
+                    "Этот матч уже внесён, возможно другим администратором. Ничего не перезаписано. "
+                    "Для продолжения нажмите «Внести новые матчи», для исправления — «Изменить матчи»."
+                )
+                return
+            rows = await conn.fetch(
+                "SELECT match_index FROM matches WHERE iso_year=$1 AND week=$2 ORDER BY match_index",
+                iso_year, week,
+            )
+            existing = {int(row["match_index"]) for row in rows}
+            missing_indices = [number for number in range(1, 11) if number not in existing]
+            if not missing_indices:
+                await conn.execute("DELETE FROM weekleaders")
+
+    if missing_indices:
+        idx = missing_indices[0]
         await state.update_data(new_match_index=idx)
         await message.answer(f"Готово, внесите следующий матч ({idx} из 10):")
         return
@@ -2005,12 +2043,6 @@ async def process_new_match(message: Message, state: FSMContext) -> None:
     await message.answer("Готово, все матчи добавлены.")
     await state.clear()
 
-    async with db_pool.acquire() as conn:
-        async with conn.transaction():
-            await clear_applied_markers(conn, iso_year, week)
-            await conn.execute("DELETE FROM weekleaders")
-
-    await clear_forecasts_for_week(iso_year, week)
     await broadcast_new_matches(message.bot, iso_year, week)
     await log_admin_action(message.from_user.id, "new_matches", f"set={iso_year}-W{week}")
 
